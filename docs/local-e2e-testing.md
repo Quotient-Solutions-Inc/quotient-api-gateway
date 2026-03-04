@@ -27,7 +27,7 @@ cp .env.example .env
 Required values:
 
 - `PORT` (default `8787`)
-- `QUOTIENT_API_BASE_URL` (default `https://quotient-markets-api.onrender.com`)
+- `QUOTIENT_API_BASE_URL` (default `https://quotient-api.vercel.app`)
 - `QUOTIENT_API_KEY` (required, from Quotient API portal)
 - `X402_TEST_TOKEN` (required for local payment simulation)
 - `BILLING_ENABLED` (default `true`)

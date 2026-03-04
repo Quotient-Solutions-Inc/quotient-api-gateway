@@ -80,7 +80,7 @@ sequenceDiagram
 
 ## Required environment variables
 
-- `QUOTIENT_API_BASE_URL` (example: `https://api.quotient.co`)
+- `QUOTIENT_API_BASE_URL` (example: `https://quotient-api.vercel.app`)
 - `QUOTIENT_API_KEY` (example: `qt_...`)
 - `X402_TEST_TOKEN` (local payment token for testing)
 - `BILLING_ENABLED`, `BILLING_PROVIDER_MODE`, `BILLING_INCLUDED_CREDITS`

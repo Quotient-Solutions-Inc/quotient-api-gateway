@@ -44,7 +44,7 @@ interface PaymentChallenge extends ApiError {
 
 const config: Config = {
   port: Number(process.env.PORT || 8787),
-  quotientApiBaseUrl: process.env.QUOTIENT_API_BASE_URL || "https://quotient-markets-api.onrender.com",
+  quotientApiBaseUrl: process.env.QUOTIENT_API_BASE_URL || "https://quotient-api.vercel.app",
   quotientApiKey: process.env.QUOTIENT_API_KEY || "",
   x402AcceptedChain: process.env.X402_ACCEPTED_CHAIN || "base",
   x402AcceptedAsset: process.env.X402_ACCEPTED_ASSET || "USDC",
