@@ -1,0 +1,26 @@
+{
+  "name": "quotient-api-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "x402-style monetization gateway for Quotient API access.",
+  "dependencies": {
+    "neo4j-driver": "^5.28.1",
+    "stripe": "^18.4.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "e2e:local": "bash scripts/e2e-local.sh"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
