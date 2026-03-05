@@ -5,13 +5,33 @@ x402-style monetization and policy gateway in front of `quotient-api`.
 ## What it does
 
 - Returns `402 Payment Required` for protected routes when payment proof is missing.
-- Accepts a local test payment token for phase-1 development.
 - Proxies read endpoints (`/api/v1/markets*`) to Quotient API.
 - Supports dual-path access:
-  - pass-through user key via `x-quotient-api-key` with subscription-credit metering
-  - x402 paid fallback via `x-payment` token when key is missing or out of credits
+  - user key via `x-quotient-api-key` for subscription-credit metering in the gateway
+  - x402 paid fallback via `PAYMENT-SIGNATURE` when key is missing or out of credits
+- Authenticates upstream to `quotient-api` using gateway service auth (`x-quotient-gateway-secret`).
 - Handles Stripe subscription webhook events at `/api/billing/stripe/webhook`.
+- Exposes internal checkout/session endpoints for portal orchestration:
+  - `GET /api/internal/billing/plans`
+  - `POST /api/internal/billing/checkout-session`
+  - `GET /api/internal/billing/checkout-session/status?sessionId=...`
 - Serves a public gateway skill artifact at `/public/skills/quotient-api-gateway/SKILL.md`.
+
+## Route Pricing Policy
+
+Monetized public route policy is centralized in `src/billing/config.ts` via a single registry resolver.
+
+- Each monetized route entry defines both:
+  - credit cost
+  - x402 amount
+- Gateway billing and x402 challenge logic both resolve from this same policy.
+- Strict mode is enforced: if a `/api/v1/*` route has no policy entry, gateway returns `422 unpriced_route`.
+
+## x402 Headers
+
+- Client sends payment proof in `PAYMENT-SIGNATURE`.
+- Gateway returns challenge metadata in `PAYMENT-REQUIRED` for `402` responses.
+- Gateway returns settlement metadata in `PAYMENT-RESPONSE` after successful paid requests.
 
 ## Quickstart
 
@@ -36,13 +56,11 @@ sequenceDiagram
     participant API as QuotientAPI
 
     Agent->>Gateway: GET /api/v1/markets + x-quotient-api-key
-    Gateway->>API: Validate upstream key via request
-    API-->>Gateway: 200 (key valid)
     Gateway->>Neo4j: Resolve ApiKey.key -> userId -> User
     Neo4j-->>Gateway: userId + BillingAccount
     Gateway->>Neo4j: Atomic decrement credits for route
     Neo4j-->>Gateway: success + creditsRemaining
-    Gateway->>API: Forward request (Bearer key)
+    Gateway->>API: Forward request (gateway service auth)
     API-->>Gateway: Market payload
     Gateway-->>Agent: 200 + payload + x-billing-credits-remaining
 ```
@@ -57,8 +75,8 @@ sequenceDiagram
 
     Agent->>Gateway: GET /api/v1/markets (no key)
     Gateway-->>Agent: 402 Payment Required (x402 challenge)
-    Agent->>Gateway: Retry GET + x-payment
-    Gateway->>API: Forward with gateway fallback API key
+    Agent->>Gateway: Retry GET + PAYMENT-SIGNATURE
+    Gateway->>API: Forward with gateway service auth
     API-->>Gateway: Market payload
     Gateway-->>Agent: 200 + payload
 ```
@@ -81,14 +99,17 @@ sequenceDiagram
 ## Required environment variables
 
 - `QUOTIENT_API_BASE_URL` (example: `https://quotient-api.vercel.app`)
-- `QUOTIENT_API_KEY` (example: `qt_...`)
-- `X402_TEST_TOKEN` (local payment token for testing)
-- `BILLING_ENABLED`, `BILLING_PROVIDER_MODE`, `BILLING_INCLUDED_CREDITS`
-- `BILLING_CREDIT_COST_MARKETS`, `BILLING_CREDIT_COST_INTELLIGENCE`, `BILLING_CREDIT_COST_SIGNALS`
-- `BILLING_STORE_BACKEND` (`memory` or `neo4j`)
-- `BILLING_MOCK_ACTIVE_USER_IDS` (optional, comma-separated canonical `User.id` values for mock mode)
-- `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` (when `BILLING_PROVIDER_MODE=stripe`)
-- `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` (required when `BILLING_STORE_BACKEND=neo4j`)
+- `QUOTIENT_GATEWAY_SHARED_SECRET` (must match `quotient-api`)
+- `QUOTIENT_INTERNAL_SERVICE_TOKEN` (must match `quotient-api`; used for internal checkout/provision calls)
+- `X402_FACILITATOR_URL`
+- `X402_ENABLED_NETWORKS` (CAIP-2 list, e.g. `eip155:84532,eip155:8453`)
+- `X402_PAY_TO_EIP155_84532`, `X402_PAY_TO_EIP155_8453`
+- `X402_PAYMENT_ID_REQUIRED`, `X402_IDEMPOTENCY_TTL_SECONDS`
+- `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`
+- `STRIPE_CHECKOUT_SUCCESS_URL`, `STRIPE_CHECKOUT_CANCEL_URL`
+- `STRIPE_PLAN_PRODUCT_METADATA_KEY`, `STRIPE_PLAN_PRODUCT_METADATA_VALUE`
+- `STRIPE_PLAN_CREDITS_METADATA_KEY`, `STRIPE_PLAN_CACHE_TTL_SECONDS`
+- `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` (required)
 
 See `.env.example` for full list.
 
@@ -99,16 +120,34 @@ Detailed instructions: `docs/local-e2e-testing.md`.
 Quick run:
 
 ```bash
-export X402_TEST_TOKEN=pay_local_test_token
-# Optional: real user key to test subscription path
+# Real subscribed user key to test subscription path
 export QUOTIENT_USER_API_KEY=qt_your_real_key
-# Optional: precomputed SHA256 of QUOTIENT_USER_API_KEY to force active subscription in mock mode
-export BILLING_MOCK_ACTIVE_API_KEY_HASHES=<sha256_hash>
-# For durable credit state:
-# export BILLING_STORE_BACKEND=neo4j
 bash scripts/e2e-local.sh
 ```
 
 ## Stripe Setup Runbook
 
 See `docs/stripe-registration-runbook.md`.
+
+## Stripe Plan Onboarding Checklist
+
+To add a new Stripe plan that the gateway auto-discovers:
+
+1. Create a Stripe product and recurring price.
+2. On the product metadata, set:
+   - `catalog=quotient_api` (must match `STRIPE_PLAN_PRODUCT_METADATA_VALUE`)
+   - optional: `plan_id=<stable_plan_id>` (for predictable plan IDs)
+3. On the price metadata, set:
+   - `included_credits=<positive integer>` (required for plan pickup)
+   - optional: `plan_id=<stable_plan_id>` (overrides product-level `plan_id`)
+4. Ensure the price is active + recurring.
+5. Restart gateway (or wait for `STRIPE_PLAN_CACHE_TTL_SECONDS`), then verify:
+   - call `GET /api/internal/billing/plans` with internal bearer token
+   - confirm new plan includes expected `planId`, `amountUsd`, `interval`, `includedCredits`
+
+## x402 Rollout Phases
+
+1. Enable `X402_ENABLED_NETWORKS=eip155:84532` in test environment and verify paid retries with `PAYMENT-SIGNATURE`.
+2. Validate idempotent retries using `payment-identifier` (same id returns cached settlement headers).
+3. Enable limited production traffic on Base Sepolia or shadow traffic.
+4. Add `eip155:8453` and `X402_PAY_TO_EIP155_8453` for full Base mainnet rollout.

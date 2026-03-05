@@ -24,17 +24,17 @@ export class InMemoryBillingStore implements BillingStoreLike {
   }
 
   private createDefaultAccount(customerId: string, apiKeyHash: string): BillingAccount {
-    const status =
-      this.config.mockSubscribedUserIds.has(customerId) || this.config.mockSubscribedApiKeyHashes.has(apiKeyHash)
-        ? "active"
-        : "inactive";
     return {
       customerId,
       apiKeyHash,
       stripeCustomerId: undefined,
-      subscriptionStatus: status,
-      creditsRemaining: status === "active" ? this.config.includedCredits : 0,
-      creditsIncluded: this.config.includedCredits,
+      planId: undefined,
+      stripePriceId: undefined,
+      stripeSubscriptionId: undefined,
+      cancelAtPeriodEnd: false,
+      subscriptionStatus: "inactive",
+      creditsRemaining: 0,
+      creditsIncluded: 0,
       currentPeriodStart: undefined,
       currentPeriodEnd: undefined,
       updatedAt: nowIso()
@@ -47,6 +47,10 @@ export class InMemoryBillingStore implements BillingStoreLike {
     const created = this.createDefaultAccount(customerId, apiKeyHash);
     this.accounts.set(customerId, created);
     return created;
+  }
+
+  async getAccount(customerId: string): Promise<BillingAccount | null> {
+    return this.accounts.get(customerId) ?? null;
   }
 
   async hasActiveSubscription(customerId: string): Promise<boolean> {
@@ -83,11 +87,26 @@ export class InMemoryBillingStore implements BillingStoreLike {
     existing.subscriptionStatus = update.subscriptionStatus;
     existing.currentPeriodStart = update.currentPeriodStart;
     existing.currentPeriodEnd = update.currentPeriodEnd;
+    if (update.planId) {
+      existing.planId = update.planId;
+    }
+    if (update.stripePriceId) {
+      existing.stripePriceId = update.stripePriceId;
+    }
+    if (update.stripeSubscriptionId) {
+      existing.stripeSubscriptionId = update.stripeSubscriptionId;
+    }
+    if (update.cancelAtPeriodEnd !== undefined) {
+      existing.cancelAtPeriodEnd = update.cancelAtPeriodEnd;
+    }
+    if (update.creditsIncluded !== undefined) {
+      existing.creditsIncluded = update.creditsIncluded;
+    }
     if (update.stripeCustomerId !== undefined) {
       existing.stripeCustomerId = update.stripeCustomerId;
     }
     if (update.replenishCredits && update.subscriptionStatus === "active") {
-      existing.creditsRemaining = existing.creditsIncluded;
+      existing.creditsRemaining = update.creditsIncluded ?? existing.creditsIncluded;
     }
     existing.updatedAt = nowIso();
     this.accounts.set(customerId, existing);
@@ -123,18 +142,17 @@ export class Neo4jBillingStore implements BillingStoreLike {
     };
   }
 
-  private defaultStatus(customerId: string, apiKeyHash: string): "active" | "inactive" {
-    if (this.config.mockSubscribedUserIds.has(customerId)) return "active";
-    return this.config.mockSubscribedApiKeyHashes.has(apiKeyHash) ? "active" : "inactive";
-  }
-
   async getOrCreateAccount(customerId: string, apiKeyHash: string): Promise<BillingAccount> {
-    const status = this.defaultStatus(customerId, apiKeyHash);
-    const credits = status === "active" ? this.config.includedCredits : 0;
+    const status: "active" | "inactive" = "inactive";
+    const credits = 0;
     const rows = await executeBillingQuery<{
       customerId: string;
       apiKeyHash: string;
       stripeCustomerId: string | null;
+      planId: string | null;
+      stripePriceId: string | null;
+      stripeSubscriptionId: string | null;
+      cancelAtPeriodEnd: boolean | null;
       subscriptionStatus: "active" | "inactive" | "past_due" | "canceled";
       creditsRemaining: number;
       creditsIncluded: number;
@@ -148,15 +166,19 @@ export class Neo4jBillingStore implements BillingStoreLike {
          b.apiKeyHash = $apiKeyHash,
          b.subscriptionStatus = $status,
          b.creditsRemaining = $credits,
-         b.creditsIncluded = $includedCredits,
+         b.creditsIncluded = 0,
          b.updatedAt = datetime()
        MERGE (u)-[:HAS_BILLING_ACCOUNT]->(b)
        RETURN b.customerId AS customerId,
               b.apiKeyHash AS apiKeyHash,
               b.stripeCustomerId AS stripeCustomerId,
+              b.planId AS planId,
+              b.stripePriceId AS stripePriceId,
+              b.stripeSubscriptionId AS stripeSubscriptionId,
+              b.cancelAtPeriodEnd AS cancelAtPeriodEnd,
               b.subscriptionStatus AS subscriptionStatus,
               COALESCE(b.creditsRemaining, 0) AS creditsRemaining,
-              COALESCE(b.creditsIncluded, $includedCredits) AS creditsIncluded,
+              COALESCE(b.creditsIncluded, 0) AS creditsIncluded,
               b.currentPeriodStart AS currentPeriodStart,
               b.currentPeriodEnd AS currentPeriodEnd,
               toString(b.updatedAt) AS updatedAt`,
@@ -164,8 +186,7 @@ export class Neo4jBillingStore implements BillingStoreLike {
         customerId,
         apiKeyHash,
         status,
-        credits,
-        includedCredits: this.config.includedCredits
+        credits
       }
     );
     const row = rows[0];
@@ -174,6 +195,10 @@ export class Neo4jBillingStore implements BillingStoreLike {
       customerId: row.customerId,
       apiKeyHash: row.apiKeyHash,
       stripeCustomerId: row.stripeCustomerId ?? undefined,
+      planId: row.planId ?? undefined,
+      stripePriceId: row.stripePriceId ?? undefined,
+      stripeSubscriptionId: row.stripeSubscriptionId ?? undefined,
+      cancelAtPeriodEnd: row.cancelAtPeriodEnd === true,
       subscriptionStatus: row.subscriptionStatus,
       creditsRemaining: row.creditsRemaining,
       creditsIncluded: row.creditsIncluded,
@@ -237,8 +262,23 @@ export class Neo4jBillingStore implements BillingStoreLike {
        FOREACH (_ IN CASE WHEN $stripeCustomerId IS NULL THEN [] ELSE [1] END |
          SET b.stripeCustomerId = $stripeCustomerId
        )
+       FOREACH (_ IN CASE WHEN $planId IS NULL THEN [] ELSE [1] END |
+         SET b.planId = $planId
+       )
+       FOREACH (_ IN CASE WHEN $stripePriceId IS NULL THEN [] ELSE [1] END |
+         SET b.stripePriceId = $stripePriceId
+       )
+       FOREACH (_ IN CASE WHEN $stripeSubscriptionId IS NULL THEN [] ELSE [1] END |
+         SET b.stripeSubscriptionId = $stripeSubscriptionId
+       )
+       FOREACH (_ IN CASE WHEN $cancelAtPeriodEnd IS NULL THEN [] ELSE [1] END |
+         SET b.cancelAtPeriodEnd = $cancelAtPeriodEnd
+       )
+       FOREACH (_ IN CASE WHEN $creditsIncluded IS NULL THEN [] ELSE [1] END |
+         SET b.creditsIncluded = $creditsIncluded
+       )
        FOREACH (_ IN CASE WHEN $replenishCredits AND $status = 'active' THEN [1] ELSE [] END |
-         SET b.creditsRemaining = COALESCE(b.creditsIncluded, $includedCredits)
+         SET b.creditsRemaining = COALESCE($creditsIncluded, b.creditsIncluded, 0)
        )`,
       {
         customerId,
@@ -246,10 +286,65 @@ export class Neo4jBillingStore implements BillingStoreLike {
         periodStart: update.currentPeriodStart ?? null,
         periodEnd: update.currentPeriodEnd ?? null,
         stripeCustomerId: update.stripeCustomerId ?? null,
+        planId: update.planId ?? null,
+        stripePriceId: update.stripePriceId ?? null,
+        stripeSubscriptionId: update.stripeSubscriptionId ?? null,
+        cancelAtPeriodEnd: update.cancelAtPeriodEnd ?? null,
+        creditsIncluded: update.creditsIncluded ?? null,
         replenishCredits: update.replenishCredits,
-        includedCredits: this.config.includedCredits
       }
     );
     return this.getOrCreateAccount(customerId, update.apiKeyHash);
+  }
+
+  async getAccount(customerId: string): Promise<BillingAccount | null> {
+    const rows = await executeBillingQuery<{
+      customerId: string;
+      apiKeyHash: string;
+      stripeCustomerId: string | null;
+      planId: string | null;
+      stripePriceId: string | null;
+      stripeSubscriptionId: string | null;
+      cancelAtPeriodEnd: boolean | null;
+      subscriptionStatus: "active" | "inactive" | "past_due" | "canceled";
+      creditsRemaining: number;
+      creditsIncluded: number;
+      currentPeriodStart: string | null;
+      currentPeriodEnd: string | null;
+      updatedAt: string;
+    }>(
+      `MATCH (b:BillingAccount {customerId: $customerId})
+       RETURN b.customerId AS customerId,
+              b.apiKeyHash AS apiKeyHash,
+              b.stripeCustomerId AS stripeCustomerId,
+              b.planId AS planId,
+              b.stripePriceId AS stripePriceId,
+              b.stripeSubscriptionId AS stripeSubscriptionId,
+              b.cancelAtPeriodEnd AS cancelAtPeriodEnd,
+              b.subscriptionStatus AS subscriptionStatus,
+              COALESCE(b.creditsRemaining, 0) AS creditsRemaining,
+              COALESCE(b.creditsIncluded, 0) AS creditsIncluded,
+              b.currentPeriodStart AS currentPeriodStart,
+              b.currentPeriodEnd AS currentPeriodEnd,
+              toString(b.updatedAt) AS updatedAt`,
+      { customerId }
+    );
+    const row = rows[0];
+    if (!row) return null;
+    return {
+      customerId: row.customerId,
+      apiKeyHash: row.apiKeyHash,
+      stripeCustomerId: row.stripeCustomerId ?? undefined,
+      planId: row.planId ?? undefined,
+      stripePriceId: row.stripePriceId ?? undefined,
+      stripeSubscriptionId: row.stripeSubscriptionId ?? undefined,
+      cancelAtPeriodEnd: row.cancelAtPeriodEnd === true,
+      subscriptionStatus: row.subscriptionStatus,
+      creditsRemaining: row.creditsRemaining,
+      creditsIncluded: row.creditsIncluded,
+      currentPeriodStart: row.currentPeriodStart ?? undefined,
+      currentPeriodEnd: row.currentPeriodEnd ?? undefined,
+      updatedAt: row.updatedAt
+    };
   }
 }

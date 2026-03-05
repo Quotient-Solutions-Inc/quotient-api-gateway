@@ -1,63 +1,138 @@
+export interface X402Config {
+  facilitatorUrl: string;
+  enabledNetworks: readonly string[];
+  payToByNetwork: Readonly<Record<string, string>>;
+  paymentIdRequired: boolean;
+  idempotencyTtlSeconds: number;
+}
+
 export interface BillingConfig {
-  enabled: boolean;
-  providerMode: "mock" | "stripe";
-  monthlyPlanId: string;
-  monthlyPlanPriceUsd: number;
-  includedCredits: number;
-  routeCreditCosts: {
-    markets: number;
-    intelligence: number;
-    signals: number;
-  };
-  mockSubscribedApiKeyHashes: Set<string>;
-  mockSubscribedUserIds: Set<string>;
+  stripeCheckoutSuccessUrl: string | undefined;
+  stripeCheckoutCancelUrl: string | undefined;
+  internalServiceToken: string | undefined;
   stripeSecretKey: string | undefined;
   stripeWebhookSecret: string | undefined;
+  stripePlanProductMetadataKey: string;
+  stripePlanProductMetadataValue: string;
+  stripePlanCreditsMetadataKey: string;
+  stripePlanCacheTtlSeconds: number;
+  x402: X402Config;
 }
 
-function parseNumber(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (!raw) return fallback;
-  const value = Number(raw);
-  if (!Number.isFinite(value)) {
-    throw new Error(`Invalid numeric env var ${name}: ${raw}`);
+export interface MonetizedRoutePolicy {
+  id: "markets" | "intelligence" | "signals";
+  match: (pathname: string) => boolean;
+  x402RoutePatterns: readonly string[];
+  creditCost: number;
+  x402Amount: number;
+}
+
+export const MONETIZED_ROUTE_POLICIES: readonly MonetizedRoutePolicy[] = [
+  {
+    id: "intelligence",
+    match: (pathname) => /^\/api\/v1\/markets\/[^/]+\/intelligence$/.test(pathname),
+    x402RoutePatterns: ["GET /api/v1/markets/*/intelligence"],
+    creditCost: 2,
+    x402Amount: 0.02
+  },
+  {
+    id: "signals",
+    match: (pathname) => /^\/api\/v1\/markets\/[^/]+\/signals$/.test(pathname),
+    x402RoutePatterns: ["GET /api/v1/markets/*/signals"],
+    creditCost: 2,
+    x402Amount: 0.015
+  },
+  {
+    id: "markets",
+    match: (pathname) =>
+      pathname === "/api/v1/markets" || pathname === "/api/v1/markets/lookup",
+    x402RoutePatterns: ["GET /api/v1/markets", "GET /api/v1/markets/lookup"],
+    creditCost: 1,
+    x402Amount: 0.01
   }
-  return value;
+] as const;
+
+export function resolveMonetizedRoutePolicy(pathname: string): MonetizedRoutePolicy | null {
+  for (const policy of MONETIZED_ROUTE_POLICIES) {
+    if (policy.match(pathname)) return policy;
+  }
+  return null;
 }
 
-export function routeKeyForPath(pathname: string): "markets" | "intelligence" | "signals" {
-  if (pathname.includes("/intelligence")) return "intelligence";
-  if (pathname.includes("/signals")) return "signals";
-  return "markets";
+function parseEnabledNetworks(input: string | undefined): string[] {
+  const raw = (input || "eip155:84532").trim();
+  const networks = raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (networks.length === 0) {
+    throw new Error("X402_ENABLED_NETWORKS must include at least one network.");
+  }
+  return Array.from(new Set(networks));
+}
+
+function parseBoolean(input: string | undefined, fallback: boolean): boolean {
+  if (!input) return fallback;
+  return input.trim().toLowerCase() === "true";
+}
+
+function parsePositiveNumber(input: string | undefined, fallback: number): number {
+  if (!input) return fallback;
+  const parsed = Number(input);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error("X402_IDEMPOTENCY_TTL_SECONDS must be a positive number.");
+  }
+  return parsed;
+}
+
+function resolvePayToByNetwork(enabledNetworks: readonly string[]): Record<string, string> {
+  const configured: Record<string, string | undefined> = {
+    "eip155:8453": process.env.X402_PAY_TO_EIP155_8453,
+    "eip155:84532": process.env.X402_PAY_TO_EIP155_84532
+  };
+  const result: Record<string, string> = {};
+  for (const network of enabledNetworks) {
+    const payTo = configured[network]?.trim();
+    if (!payTo) {
+      throw new Error(`Missing payTo wallet for enabled network '${network}'.`);
+    }
+    result[network] = payTo;
+  }
+  return result;
 }
 
 export function loadBillingConfig(): BillingConfig {
-  const hashList = (process.env.BILLING_MOCK_ACTIVE_API_KEY_HASHES || "")
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-  const userList = (process.env.BILLING_MOCK_ACTIVE_USER_IDS || "")
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-
-  const providerModeRaw = (process.env.BILLING_PROVIDER_MODE || "mock").toLowerCase();
-  const providerMode = providerModeRaw === "stripe" ? "stripe" : "mock";
+  const enabledNetworks = parseEnabledNetworks(process.env.X402_ENABLED_NETWORKS);
+  const payToByNetwork = resolvePayToByNetwork(enabledNetworks);
+  const stripePlanProductMetadataKey = (process.env.STRIPE_PLAN_PRODUCT_METADATA_KEY || "catalog").trim();
+  const stripePlanProductMetadataValue = (process.env.STRIPE_PLAN_PRODUCT_METADATA_VALUE || "quotient_api").trim();
+  const stripePlanCreditsMetadataKey = (process.env.STRIPE_PLAN_CREDITS_METADATA_KEY || "included_credits").trim();
+  if (!stripePlanProductMetadataKey) {
+    throw new Error("STRIPE_PLAN_PRODUCT_METADATA_KEY cannot be empty.");
+  }
+  if (!stripePlanProductMetadataValue) {
+    throw new Error("STRIPE_PLAN_PRODUCT_METADATA_VALUE cannot be empty.");
+  }
+  if (!stripePlanCreditsMetadataKey) {
+    throw new Error("STRIPE_PLAN_CREDITS_METADATA_KEY cannot be empty.");
+  }
 
   return {
-    enabled: (process.env.BILLING_ENABLED || "true").toLowerCase() !== "false",
-    providerMode,
-    monthlyPlanId: process.env.BILLING_PLAN_ID || "starter_10",
-    monthlyPlanPriceUsd: parseNumber("BILLING_PLAN_PRICE_USD", 10),
-    includedCredits: parseNumber("BILLING_INCLUDED_CREDITS", 1000),
-    routeCreditCosts: {
-      markets: parseNumber("BILLING_CREDIT_COST_MARKETS", 1),
-      intelligence: parseNumber("BILLING_CREDIT_COST_INTELLIGENCE", 2),
-      signals: parseNumber("BILLING_CREDIT_COST_SIGNALS", 2)
-    },
-    mockSubscribedApiKeyHashes: new Set(hashList),
-    mockSubscribedUserIds: new Set(userList),
+    stripeCheckoutSuccessUrl: process.env.STRIPE_CHECKOUT_SUCCESS_URL,
+    stripeCheckoutCancelUrl: process.env.STRIPE_CHECKOUT_CANCEL_URL,
+    internalServiceToken: process.env.QUOTIENT_INTERNAL_SERVICE_TOKEN,
     stripeSecretKey: process.env.STRIPE_SECRET_KEY,
-    stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET
+    stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
+    stripePlanProductMetadataKey,
+    stripePlanProductMetadataValue,
+    stripePlanCreditsMetadataKey,
+    stripePlanCacheTtlSeconds: parsePositiveNumber(process.env.STRIPE_PLAN_CACHE_TTL_SECONDS, 300),
+    x402: {
+      facilitatorUrl: process.env.X402_FACILITATOR_URL || "https://x402.org/facilitator",
+      enabledNetworks,
+      payToByNetwork,
+      paymentIdRequired: parseBoolean(process.env.X402_PAYMENT_ID_REQUIRED, false),
+      idempotencyTtlSeconds: parsePositiveNumber(process.env.X402_IDEMPOTENCY_TTL_SECONDS, 3600)
+    }
   };
 }

@@ -28,25 +28,27 @@ Required values:
 
 - `PORT` (default `8787`)
 - `QUOTIENT_API_BASE_URL` (default `https://quotient-api.vercel.app`)
-- `QUOTIENT_API_KEY` (required, from Quotient API portal)
-- `X402_TEST_TOKEN` (required for local payment simulation)
-- `BILLING_ENABLED` (default `true`)
-- `BILLING_PROVIDER_MODE` (`mock` or `stripe`)
-- `BILLING_STORE_BACKEND` (`memory` or `neo4j`)
-- `BILLING_INCLUDED_CREDITS` (monthly included credits)
-- `BILLING_CREDIT_COST_MARKETS`, `BILLING_CREDIT_COST_INTELLIGENCE`, `BILLING_CREDIT_COST_SIGNALS`
-- `BILLING_MOCK_ACTIVE_API_KEY_HASHES` (comma-separated SHA256 hashes in mock mode)
-- `BILLING_MOCK_ACTIVE_USER_IDS` (comma-separated canonical `User.id` values in mock mode)
-- `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` (stripe mode only)
-- `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` (required when `BILLING_STORE_BACKEND=neo4j`)
+- `QUOTIENT_GATEWAY_SHARED_SECRET` (required; must match quotient-api)
+- `X402_FACILITATOR_URL` (default `https://x402.org/facilitator`)
+- `X402_ENABLED_NETWORKS` (comma-separated CAIP-2 values)
+- `X402_PAY_TO_EIP155_84532` and/or `X402_PAY_TO_EIP155_8453`
+- `X402_PAYMENT_ID_REQUIRED` (default `false`)
+- `X402_IDEMPOTENCY_TTL_SECONDS` (default `3600`)
+- `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_CHECKOUT_SUCCESS_URL`, `STRIPE_CHECKOUT_CANCEL_URL`
+- `STRIPE_PLAN_PRODUCT_METADATA_KEY`, `STRIPE_PLAN_PRODUCT_METADATA_VALUE`
+- `STRIPE_PLAN_CREDITS_METADATA_KEY`, `STRIPE_PLAN_CACHE_TTL_SECONDS`
+- `QUOTIENT_INTERNAL_SERVICE_TOKEN` (required for internal checkout/provisioning calls)
+- `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` (required)
 
 Pricing and metadata vars:
 
-- `X402_ACCEPTED_CHAIN` (default `base`)
-- `X402_ACCEPTED_ASSET` (default `USDC`)
-- `X402_PRICE_MARKETS` (default `0.01`)
-- `X402_PRICE_INTELLIGENCE` (default `0.02`)
-- `X402_PRICE_SIGNALS` (default `0.015`)
+- x402 route pricing is code-defined in gateway billing policy config
+- Monetized route policy is centralized in `src/billing/config.ts`
+- Strict mode: unknown `/api/v1/*` routes return `422 unpriced_route`
+- Header semantics follow x402 v2:
+  - request proof: `PAYMENT-SIGNATURE`
+  - payment challenge: `PAYMENT-REQUIRED`
+  - settlement proof: `PAYMENT-RESPONSE`
 
 ## Start the gateway
 
@@ -79,20 +81,6 @@ bash scripts/e2e-local.sh
 
 ## Manual E2E matrix
 
-### 0) Optional: generate mock subscriber hash
-
-To mark a real `qt_` key as subscribed in mock mode:
-
-```bash
-python3 - <<'PY'
-import hashlib, os
-key = os.environ.get("QUOTIENT_USER_API_KEY", "")
-print(hashlib.sha256(key.encode()).hexdigest() if key else "Set QUOTIENT_USER_API_KEY first")
-PY
-```
-
-Add the hash to `BILLING_MOCK_ACTIVE_API_KEY_HASHES` in `.env`, restart gateway.
-
 ### 1) Valid key + active credits
 
 ```bash
@@ -110,16 +98,9 @@ Expected:
 
 ### 2) Valid key + exhausted credits
 
-Set low included credits in `.env` for easy testing:
+Run repeated calls with the same subscribed key until credits are exhausted.
 
-```bash
-BILLING_INCLUDED_CREDITS=1
-BILLING_CREDIT_COST_MARKETS=2
-```
-
-Restart gateway, then retry request with same valid key.
-
-Expected: `HTTP/1.1 402 Payment Required` with `billing.required_credits` in body.
+Expected: eventually `HTTP/1.1 402 Payment Required` with `billing.required_credits` in body.
 
 ### 3) Missing key (x402 challenge)
 
@@ -138,31 +119,46 @@ curl -i \
   "http://localhost:${PORT:-8787}/api/v1/markets?limit=1"
 ```
 
-Expected: `HTTP/1.1 401` or `403` from upstream key validation.
+Expected: `HTTP/1.1 401` from gateway key validation/billing identity resolution.
 
 ### 5) Paid retry succeeds
 
+Create a valid x402 payment payload with an x402-compatible client/wallet, then retry with
+the returned `PAYMENT-SIGNATURE` header:
+
 ```bash
 curl -i \
-  -H "x-payment: ${X402_TEST_TOKEN}" \
+  -H "PAYMENT-SIGNATURE: <base64_payment_payload>" \
   "http://localhost:${PORT:-8787}/api/v1/markets?limit=1"
 ```
 
 Expected: `HTTP/1.1 200` with markets payload.
 
-### 6) Webhook cycle renew (Stripe mode)
+### 6) Webhook cycle renew
 
-When `BILLING_PROVIDER_MODE=stripe` and webhook is registered:
+When webhook is registered:
 
 - send `invoice.paid` event with subscription metadata including canonical `user_id`
 - `api_key_hash` is optional and used only for debugging/legacy visibility
-- verify credits are replenished to `BILLING_INCLUDED_CREDITS`
+- verify credits are replenished to the plan's included credit amount (defined in gateway billing config)
 
 With Stripe CLI (example):
 
 ```bash
 stripe trigger invoice.paid
 ```
+
+### 7) Internal checkout session create (Stripe mode)
+
+```bash
+curl -i -X POST \
+  -H "authorization: Bearer ${QUOTIENT_INTERNAL_SERVICE_TOKEN}" \
+  -H "content-type: application/json" \
+  -d '{"userId":"user_test_123","privyId":"did:privy:test_user","planId":"starter_20"}' \
+  "http://localhost:${PORT:-8787}/api/internal/billing/checkout-session"
+```
+
+Expected: `HTTP/1.1 200` with `checkoutUrl` + `sessionId`.
 
 ## Manual negative tests
 
@@ -174,14 +170,14 @@ curl -i "http://localhost:${PORT:-8787}/api/v1/markets?limit=1"
 
 Expected: `HTTP/1.1 402 Payment Required`.
 
-### 2) Missing upstream fallback API key
+### 2) Missing upstream gateway shared secret
 
-Unset `QUOTIENT_API_KEY` and restart.
+Unset `QUOTIENT_GATEWAY_SHARED_SECRET` and restart.
 
 Expected startup failure:
 
 ```text
-Missing QUOTIENT_API_KEY
+Missing QUOTIENT_GATEWAY_SHARED_SECRET
 ```
 
 ### 3) Stripe webhook endpoint not configured
@@ -190,4 +186,12 @@ Missing QUOTIENT_API_KEY
 curl -i -X POST "http://localhost:${PORT:-8787}/api/billing/stripe/webhook"
 ```
 
-Expected in mock mode: `HTTP/1.1 503` with `stripe_not_configured`.
+Expected when Stripe mode is not configured: `HTTP/1.1 503` with `stripe_not_configured`.
+
+### 4) Unknown monetized route policy
+
+```bash
+curl -i "http://localhost:${PORT:-8787}/api/v1/equities?limit=1"
+```
+
+Expected: `HTTP/1.1 422` with `unpriced_route`.

@@ -114,8 +114,8 @@ Add monitoring and consistency checks:
 {
   "customer_id": "cus_123",
   "subscription_status": "active",
-  "plan_id": "plan_starter_10",
-  "credits_included": 10000,
+  "plan_id": "starter_20",
+  "credits_included": 1000,
   "credits_remaining": 7420,
   "current_period_start": "2026-03-01T00:00:00Z",
   "current_period_end": "2026-04-01T00:00:00Z",
@@ -127,7 +127,7 @@ Add monitoring and consistency checks:
 
 ```json
 {
-  "plan_id": "plan_starter_10",
+  "plan_id": "starter_20",
   "route_credit_costs": {
     "/api/v1/markets": 1,
     "/api/v1/markets/{slug}/intelligence": 2,

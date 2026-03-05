@@ -9,8 +9,8 @@ description: Accesses Quotient market intelligence through the API gateway with 
 
 - Use `x-quotient-api-key: qt_...` when available.
 - If API key is valid and subscription credits are available, request is served and credits are decremented by route cost.
-- If API key is missing, gateway returns `402` challenge; retry can use `x-payment`.
-- If API key is invalid, gateway returns upstream auth error (`401`/`403`) and does not fallback to `402`.
+- If API key is missing, gateway returns `402` challenge; retry can use `PAYMENT-SIGNATURE`.
+- If API key is invalid, gateway returns `401` and does not fallback to `402`.
 
 ## Core Endpoints
 
@@ -33,5 +33,5 @@ description: Accesses Quotient market intelligence through the API gateway with 
 
 1. Send request with `x-quotient-api-key`.
 2. If `200`, consume payload.
-3. If `402`, pay and retry with `x-payment`.
-4. If `401/403`, treat as key/auth issue and rotate/fix key.
+3. If `402`, pay and retry with `PAYMENT-SIGNATURE`.
+4. If `401`, treat as key/auth issue and rotate/fix key.

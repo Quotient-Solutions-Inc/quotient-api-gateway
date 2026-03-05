@@ -5,6 +5,10 @@
   "type": "module",
   "description": "x402-style monetization gateway for Quotient API access.",
   "dependencies": {
+    "@x402/core": "^2.5.0",
+    "@x402/evm": "^2.5.0",
+    "@x402/extensions": "^2.5.0",
+    "dotenv": "^17.3.1",
     "neo4j-driver": "^5.28.1",
     "stripe": "^18.4.0"
   },
@@ -13,6 +17,7 @@
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/**/*.test.js",
     "e2e:local": "bash scripts/e2e-local.sh"
   },
   "devDependencies": {

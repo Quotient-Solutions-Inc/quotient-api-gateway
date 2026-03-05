@@ -1,3 +1,4 @@
+import "dotenv/config";
 import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import crypto from "node:crypto";
@@ -5,21 +6,16 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { URL } from "node:url";
-import { InMemoryBillingStore, Neo4jBillingStore } from "./billing/store.js";
+import { Neo4jBillingStore } from "./billing/store.js";
 import { StripeBillingService } from "./billing/stripe.js";
-import { loadBillingConfig, routeKeyForPath } from "./billing/config.js";
+import { loadBillingConfig, resolveMonetizedRoutePolicy } from "./billing/config.js";
 import type { BillingStoreLike, CreditUsageEvent } from "./billing/types.js";
+import { X402PaymentGateway } from "./billing/x402.js";
 
 interface Config {
   port: number;
   quotientApiBaseUrl: string;
-  quotientApiKey: string;
-  x402AcceptedChain: string;
-  x402AcceptedAsset: string;
-  x402PriceMarkets: number;
-  x402PriceIntelligence: number;
-  x402PriceSignals: number;
-  x402TestToken: string;
+  gatewaySharedSecret: string;
 }
 
 interface ApiError {
@@ -27,42 +23,24 @@ interface ApiError {
   message: string;
 }
 
-interface PaymentChallenge extends ApiError {
-  payment: {
-    protocol: "x402";
-    chain: string;
-    asset: string;
-    amount: number;
-    recipient: string;
-    memo: string;
-  };
-  billing?: {
-    plan_id: string;
-    required_credits: number;
-  };
-}
-
 const config: Config = {
   port: Number(process.env.PORT || 8787),
   quotientApiBaseUrl: process.env.QUOTIENT_API_BASE_URL || "https://quotient-api.vercel.app",
-  quotientApiKey: process.env.QUOTIENT_API_KEY || "",
-  x402AcceptedChain: process.env.X402_ACCEPTED_CHAIN || "base",
-  x402AcceptedAsset: process.env.X402_ACCEPTED_ASSET || "USDC",
-  x402PriceMarkets: Number(process.env.X402_PRICE_MARKETS || 0.01),
-  x402PriceIntelligence: Number(process.env.X402_PRICE_INTELLIGENCE || 0.02),
-  x402PriceSignals: Number(process.env.X402_PRICE_SIGNALS || 0.015),
-  x402TestToken: process.env.X402_TEST_TOKEN || "pay_local_test_token"
+  gatewaySharedSecret: process.env.QUOTIENT_GATEWAY_SHARED_SECRET || ""
 };
 const billingConfig = loadBillingConfig();
-const billingStore: BillingStoreLike = process.env.BILLING_STORE_BACKEND === "neo4j"
-  ? new Neo4jBillingStore(billingConfig)
-  : new InMemoryBillingStore(billingConfig);
+const billingStore: BillingStoreLike = new Neo4jBillingStore(billingConfig);
 const stripeBilling = new StripeBillingService(billingConfig);
+const x402Gateway = new X402PaymentGateway(billingConfig);
 const thisDir = path.dirname(fileURLToPath(import.meta.url));
 const publicSkillPath = path.resolve(thisDir, "../public/skills/quotient-api-gateway/SKILL.md");
 
-if (!config.quotientApiKey) {
-  console.error("Missing QUOTIENT_API_KEY");
+if (!config.gatewaySharedSecret) {
+  console.error("Missing QUOTIENT_GATEWAY_SHARED_SECRET");
+  process.exit(1);
+}
+if (!billingConfig.internalServiceToken) {
+  console.error("Missing QUOTIENT_INTERNAL_SERVICE_TOKEN");
   process.exit(1);
 }
 
@@ -79,33 +57,6 @@ function json(
   res.end(JSON.stringify(body, null, 2));
 }
 
-function getPriceForPath(pathname: string): number {
-  if (pathname.includes("/intelligence")) return config.x402PriceIntelligence;
-  if (pathname.includes("/signals")) return config.x402PriceSignals;
-  return config.x402PriceMarkets;
-}
-
-function build402Challenge(pathname: string): PaymentChallenge {
-  const routeKey = routeKeyForPath(pathname);
-  const routeCreditCost = billingConfig.routeCreditCosts[routeKey];
-  return {
-    error: "payment_required",
-    message: "Pay this request with x402 before retrying.",
-    payment: {
-      protocol: "x402",
-      chain: config.x402AcceptedChain,
-      asset: config.x402AcceptedAsset,
-      amount: getPriceForPath(pathname),
-      recipient: "quotient-api-gateway",
-      memo: pathname
-    },
-    billing: {
-      plan_id: billingConfig.monthlyPlanId,
-      required_credits: routeCreditCost
-    }
-  };
-}
-
 async function readRawBody(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
@@ -114,44 +65,31 @@ async function readRawBody(req: IncomingMessage): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-function requirePayment(req: IncomingMessage, res: ServerResponse): boolean {
-  const paymentHeader = req.headers["x-payment"];
-  if (paymentHeader !== config.x402TestToken) {
-    const path = new URL(req.url || "/", "http://localhost").pathname;
-    json(res, 402, build402Challenge(path), {
-      "x-payment-protocol": "x402",
-      "x-payment-chain": config.x402AcceptedChain,
-      "x-payment-asset": config.x402AcceptedAsset
-    });
-    return false;
+async function readJsonBody<T>(req: IncomingMessage): Promise<T> {
+  const raw = await readRawBody(req);
+  try {
+    return JSON.parse(raw.toString("utf8")) as T;
+  } catch {
+    throw new Error("invalid_json_body");
   }
-  return true;
 }
 
 async function proxyToQuotient(req: IncomingMessage): Promise<Response> {
   const reqUrl = new URL(req.url || "/", "http://localhost");
   const upstreamUrl = new URL(reqUrl.pathname + reqUrl.search, config.quotientApiBaseUrl);
-  const quotedApiKey = req.headers["x-quotient-api-key"];
-  const hasQuotedApiKey = typeof quotedApiKey === "string" && quotedApiKey.trim() !== "";
-  const upstreamApiKey = hasQuotedApiKey ? quotedApiKey.trim() : config.quotientApiKey;
-  const gatewaySharedSecret = process.env.QUOTIENT_GATEWAY_SHARED_SECRET;
   const upstreamHeaders: Record<string, string> = {
-    Authorization: `Bearer ${upstreamApiKey}`,
-    "content-type": "application/json"
+    "content-type": "application/json",
+    "x-quotient-gateway-secret": config.gatewaySharedSecret
   };
-  if (gatewaySharedSecret) {
-    upstreamHeaders["x-quotient-gateway-secret"] = gatewaySharedSecret;
+  const incomingRequestId = req.headers["x-request-id"];
+  if (typeof incomingRequestId === "string" && incomingRequestId.trim() !== "") {
+    upstreamHeaders["x-request-id"] = incomingRequestId.trim();
   }
 
   return fetch(upstreamUrl, {
     method: "GET",
     headers: upstreamHeaders
   });
-}
-
-function getRouteCreditCost(pathname: string): number {
-  const key = routeKeyForPath(pathname);
-  return billingConfig.routeCreditCosts[key];
 }
 
 function emitUsageLog(event: CreditUsageEvent): void {
@@ -164,17 +102,221 @@ function requestIdFrom(req: IncomingMessage): string {
   return crypto.randomUUID();
 }
 
+function isInternalServiceAuthorized(req: IncomingMessage): boolean {
+  const token = billingConfig.internalServiceToken;
+  if (!token) return false;
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith("Bearer ")) return false;
+  return auth.slice(7).trim() === token;
+}
+
+async function provisionPaidUserFromStripe(userId: string, requestId: string): Promise<void> {
+  const serviceToken = billingConfig.internalServiceToken;
+  if (!serviceToken) {
+    throw new Error("missing_internal_service_token");
+  }
+  const provisionUrl = new URL("/api/internal/provision/paid-user", config.quotientApiBaseUrl);
+  const response = await fetch(provisionUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${serviceToken}`,
+      "x-request-id": requestId
+    },
+    body: JSON.stringify({
+      userId,
+      source: "stripe_webhook"
+    })
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`provisioning_failed:${response.status}:${body}`);
+  }
+}
+
+async function handleCheckoutSessionCreate(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (req.method !== "POST") {
+    json(res, 405, { error: "method_not_allowed", message: "Use POST." });
+    return;
+  }
+  if (!isInternalServiceAuthorized(req)) {
+    json(res, 401, { error: "unauthorized", message: "Missing or invalid internal service token." });
+    return;
+  }
+  if (!stripeBilling.canCreateCheckoutSessions()) {
+    json(res, 503, { error: "stripe_checkout_not_configured", message: "Stripe checkout is not configured." });
+    return;
+  }
+
+  let body: { userId?: string; privyId?: string; planId?: string; email?: string | null };
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    json(res, 422, { error: "invalid_request", message: "Invalid JSON body." });
+    return;
+  }
+
+  const userId = body.userId?.trim();
+  const privyId = body.privyId?.trim();
+  const planId = body.planId?.trim();
+  if (!userId || !privyId || !planId) {
+    json(res, 422, { error: "invalid_request", message: "userId, privyId, and planId are required." });
+    return;
+  }
+
+  try {
+    const selectedPlan = await stripeBilling.getSelectablePlanById(planId);
+    if (!selectedPlan) {
+      json(res, 422, { error: "invalid_plan", message: `Unknown or unavailable plan '${planId}'.` });
+      return;
+    }
+    const session = await stripeBilling.createCheckoutSession({
+      userId,
+      privyId,
+      plan: selectedPlan,
+      email: typeof body.email === "string" ? body.email : null
+    });
+    json(res, 200, {
+      checkoutUrl: session.url,
+      sessionId: session.id
+    });
+  } catch (error: unknown) {
+    json(res, 500, {
+      error: "checkout_session_create_failed",
+      message: error instanceof Error ? error.message : "Failed to create Stripe checkout session."
+    });
+  }
+}
+
+async function handlePlansList(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (req.method !== "GET") {
+    json(res, 405, { error: "method_not_allowed", message: "Use GET." });
+    return;
+  }
+  if (!isInternalServiceAuthorized(req)) {
+    json(res, 401, { error: "unauthorized", message: "Missing or invalid internal service token." });
+    return;
+  }
+  try {
+    const plans = await stripeBilling.listSelectablePlans();
+    json(res, 200, { plans });
+  } catch (error: unknown) {
+    json(res, 500, {
+      error: "plans_list_failed",
+      message: error instanceof Error ? error.message : "Failed to list available plans."
+    });
+  }
+}
+
+async function handleCheckoutSessionLookup(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (req.method !== "GET") {
+    json(res, 405, { error: "method_not_allowed", message: "Use GET." });
+    return;
+  }
+  if (!isInternalServiceAuthorized(req)) {
+    json(res, 401, { error: "unauthorized", message: "Missing or invalid internal service token." });
+    return;
+  }
+  const reqUrl = new URL(req.url || "/", "http://localhost");
+  const sessionId = reqUrl.searchParams.get("sessionId");
+  if (!sessionId) {
+    json(res, 422, { error: "invalid_request", message: "sessionId is required." });
+    return;
+  }
+  try {
+    const session = await stripeBilling.getCheckoutSession(sessionId);
+    json(res, 200, session);
+  } catch (error: unknown) {
+    json(res, 500, {
+      error: "checkout_session_lookup_failed",
+      message: error instanceof Error ? error.message : "Failed to fetch checkout session."
+    });
+  }
+}
+
+async function handleSubscriptionCancel(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (req.method !== "POST") {
+    json(res, 405, { error: "method_not_allowed", message: "Use POST." });
+    return;
+  }
+  if (!isInternalServiceAuthorized(req)) {
+    json(res, 401, { error: "unauthorized", message: "Missing or invalid internal service token." });
+    return;
+  }
+  let body: { userId?: string };
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    json(res, 422, { error: "invalid_request", message: "Invalid JSON body." });
+    return;
+  }
+  const userId = body.userId?.trim();
+  if (!userId) {
+    json(res, 422, { error: "invalid_request", message: "userId is required." });
+    return;
+  }
+  const account = await billingStore.getAccount(userId);
+  if (!account) {
+    json(res, 404, { error: "not_found", message: "Billing account not found." });
+    return;
+  }
+  if (!account.stripeCustomerId && !account.stripeSubscriptionId) {
+    json(res, 422, { error: "missing_stripe_subscription", message: "No Stripe subscription found." });
+    return;
+  }
+  try {
+    const cancelInput: { stripeCustomerId?: string; stripeSubscriptionId?: string } = {};
+    if (account.stripeCustomerId) cancelInput.stripeCustomerId = account.stripeCustomerId;
+    if (account.stripeSubscriptionId) cancelInput.stripeSubscriptionId = account.stripeSubscriptionId;
+    const canceled = await stripeBilling.cancelSubscriptionAtPeriodEnd({
+      ...cancelInput
+    });
+    const updated = await billingStore.applyStripeState({
+      userId,
+      apiKeyHash: account.apiKeyHash,
+      stripeCustomerId: account.stripeCustomerId,
+      planId: account.planId,
+      stripePriceId: account.stripePriceId,
+      stripeSubscriptionId: canceled.subscriptionId,
+      cancelAtPeriodEnd: canceled.cancelAtPeriodEnd,
+      creditsIncluded: account.creditsIncluded,
+      subscriptionStatus:
+        canceled.status === "active"
+          ? "active"
+          : canceled.status === "past_due"
+            ? "past_due"
+            : canceled.status === "canceled"
+              ? "canceled"
+              : "inactive",
+      currentPeriodStart: account.currentPeriodStart,
+      currentPeriodEnd: canceled.currentPeriodEnd,
+      replenishCredits: false
+    });
+    json(res, 200, {
+      ok: true,
+      customerId: updated.customerId,
+      planId: updated.planId ?? null,
+      subscriptionStatus: updated.subscriptionStatus,
+      cancelAtPeriodEnd: updated.cancelAtPeriodEnd,
+      currentPeriodEnd: updated.currentPeriodEnd ?? null
+    });
+  } catch (error: unknown) {
+    json(res, 500, {
+      error: "subscription_cancel_failed",
+      message: error instanceof Error ? error.message : "Failed to cancel subscription."
+    });
+  }
+}
+
 async function canUseSubscriptionCredits(
   apiKey: string,
   pathname: string,
+  routeCreditCost: number,
   requestId: string
-): Promise<{ allowed: boolean; customerId: string; remaining: number }> {
-  if (!billingConfig.enabled) {
-    return { allowed: true, customerId: "billing_disabled", remaining: Number.MAX_SAFE_INTEGER };
-  }
+): Promise<{ allowed: boolean; invalidKey?: boolean; customerId: string; remaining: number }> {
   const resolved = await billingStore.resolveCustomerFromApiKey(apiKey);
   if (!resolved) {
-    throw new Error("Billing identity resolution failed for provided API key.");
+    return { allowed: false, invalidKey: true, customerId: "invalid_api_key", remaining: 0 };
   }
   const { customerId, apiKeyHash } = resolved;
   await billingStore.getOrCreateAccount(customerId, apiKeyHash);
@@ -193,19 +335,35 @@ async function canUseSubscriptionCredits(
     });
     return { allowed: false, customerId, remaining };
   }
-  const routeCost = getRouteCreditCost(pathname);
-  const consumed = await billingStore.consumeCreditsForRoute(customerId, pathname, routeCost, "subscription");
+  const consumed = await billingStore.consumeCreditsForRoute(customerId, pathname, routeCreditCost, "subscription");
   emitUsageLog({
     timestamp: new Date().toISOString(),
     requestId,
     customerId,
     route: pathname,
-    creditsCharged: consumed.ok ? routeCost : 0,
+    creditsCharged: consumed.ok ? routeCreditCost : 0,
     creditsRemaining: consumed.remaining,
     decision: consumed.ok ? "subscription_allowed" : "subscription_insufficient_credits",
     source: "subscription"
   });
   return { allowed: consumed.ok, customerId, remaining: consumed.remaining };
+}
+
+function respondWithX402Instructions(
+  res: ServerResponse,
+  status: number,
+  response: { body?: unknown; headers: Record<string, string> },
+  requestId: string
+): void {
+  json(
+    res,
+    status,
+    response.body || { error: "payment_required", message: "Payment is required for this route." },
+    {
+      ...response.headers,
+      "x-request-id": requestId
+    }
+  );
 }
 
 async function servePublicSkill(res: ServerResponse): Promise<void> {
@@ -229,25 +387,42 @@ async function handleStripeWebhook(req: IncomingMessage, res: ServerResponse): P
 
   const body = await readRawBody(req);
   const signature = req.headers["stripe-signature"];
+  let event;
   try {
-    const event = stripeBilling.parseWebhookEvent(body, typeof signature === "string" ? signature : undefined);
-    const update = stripeBilling.toStateUpdateFromEvent(event);
-    if (update) {
-      const account = await billingStore.applyStripeState(update);
-      json(res, 200, {
-        ok: true,
-        event_type: event.type,
-        customer_id: account.customerId,
-        subscription_status: account.subscriptionStatus,
-        credits_remaining: account.creditsRemaining
-      });
-      return;
-    }
-    json(res, 200, { ok: true, ignored: true, event_type: event.type });
+    event = stripeBilling.parseWebhookEvent(body, typeof signature === "string" ? signature : undefined);
   } catch (error: unknown) {
     json(res, 400, {
       error: "invalid_webhook",
       message: error instanceof Error ? error.message : "Failed to process webhook."
+    });
+    return;
+  }
+
+  const update = stripeBilling.toStateUpdateFromEvent(event);
+  if (!update) {
+    json(res, 200, { ok: true, ignored: true, eventType: event.type });
+    return;
+  }
+
+  try {
+    const account = await billingStore.applyStripeState(update);
+    let provisionedApiKey = false;
+    if (update.userId && update.subscriptionStatus === "active") {
+      await provisionPaidUserFromStripe(update.userId, requestIdFrom(req));
+      provisionedApiKey = true;
+    }
+    json(res, 200, {
+      ok: true,
+      eventType: event.type,
+      customerId: account.customerId,
+      subscriptionStatus: account.subscriptionStatus,
+      creditsRemaining: account.creditsRemaining,
+      provisionedApiKey
+    });
+  } catch (error: unknown) {
+    json(res, 500, {
+      error: "stripe_state_update_failed",
+      message: error instanceof Error ? error.message : "Failed to apply Stripe state update."
     });
   }
 }
@@ -276,12 +451,16 @@ async function handleBillingSummary(req: IncomingMessage, res: ServerResponse): 
     }
     const account = await billingStore.getOrCreateAccount(resolved.customerId, resolved.apiKeyHash);
     json(res, 200, {
-      customer_id: account.customerId,
-      subscription_status: account.subscriptionStatus,
-      credits_remaining: account.creditsRemaining,
-      credits_included: account.creditsIncluded,
-      current_period_start: account.currentPeriodStart ?? null,
-      current_period_end: account.currentPeriodEnd ?? null
+      customerId: account.customerId,
+      planId: account.planId ?? null,
+      stripePriceId: account.stripePriceId ?? null,
+      stripeSubscriptionId: account.stripeSubscriptionId ?? null,
+      subscriptionStatus: account.subscriptionStatus,
+      cancelAtPeriodEnd: account.cancelAtPeriodEnd,
+      creditsRemaining: account.creditsRemaining,
+      creditsIncluded: account.creditsIncluded,
+      currentPeriodStart: account.currentPeriodStart ?? null,
+      currentPeriodEnd: account.currentPeriodEnd ?? null
     }, {
       "x-request-id": requestId
     });
@@ -324,30 +503,48 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (pathname === "/api/internal/billing/checkout-session") {
+      await handleCheckoutSessionCreate(req, res);
+      return;
+    }
+
+    if (pathname === "/api/internal/billing/checkout-session/status") {
+      await handleCheckoutSessionLookup(req, res);
+      return;
+    }
+
+    if (pathname === "/api/internal/billing/plans") {
+      await handlePlansList(req, res);
+      return;
+    }
+
+    if (pathname === "/api/internal/billing/subscription/cancel") {
+      await handleSubscriptionCancel(req, res);
+      return;
+    }
+
     if (pathname === "/api/billing/summary") {
       await handleBillingSummary(req, res);
       return;
     }
 
-    if (pathname.startsWith("/api/v1/markets") && req.method === "GET") {
+    if (pathname.startsWith("/api/v1/") && req.method === "GET") {
+      const policy = resolveMonetizedRoutePolicy(pathname);
+      if (!policy) {
+        json(res, 422, {
+          error: "unpriced_route",
+          message: `No monetization policy defined for route '${pathname}'.`
+        });
+        return;
+      }
       const requestId = requestIdFrom(req);
       const clientKey = req.headers["x-quotient-api-key"];
       const hasClientKey = typeof clientKey === "string" && clientKey.trim() !== "";
 
       if (hasClientKey) {
-        const upstreamRes = await proxyToQuotient(req);
-        if (upstreamRes.status === 401 || upstreamRes.status === 403) {
-          const text = await upstreamRes.text();
-          res.writeHead(upstreamRes.status, {
-            "content-type": upstreamRes.headers.get("content-type") || "application/json; charset=utf-8"
-          });
-          res.end(text);
-          return;
-        }
-
         let billing;
         try {
-          billing = await canUseSubscriptionCredits(clientKey.trim(), pathname, requestId);
+          billing = await canUseSubscriptionCredits(clientKey.trim(), pathname, policy.creditCost, requestId);
         } catch (error: unknown) {
           json(res, 500, {
             error: "billing_identity_mapping_error",
@@ -357,16 +554,43 @@ const server = http.createServer(async (req, res) => {
           });
           return;
         }
-        if (!billing.allowed) {
-          json(res, 402, build402Challenge(pathname), {
-            "x-payment-protocol": "x402",
-            "x-payment-chain": config.x402AcceptedChain,
-            "x-payment-asset": config.x402AcceptedAsset,
+        if (billing.invalidKey) {
+          json(res, 401, {
+            error: "invalid_api_key",
+            message: "Provided API key is invalid."
+          }, {
             "x-request-id": requestId
           });
           return;
         }
+        if (!billing.allowed) {
+          const paymentAuth = await x402Gateway.requirePayment(req, pathname);
+          if (paymentAuth.kind === "deny") {
+            respondWithX402Instructions(res, paymentAuth.response.status, paymentAuth.response, requestId);
+            return;
+          }
+          const upstreamRes = await proxyToQuotient(req);
+          const text = await upstreamRes.text();
+          const settlementHeaders = await x402Gateway.finalizeSettlement(paymentAuth, text, upstreamRes.status);
+          emitUsageLog({
+            timestamp: new Date().toISOString(),
+            requestId,
+            customerId: billing.customerId,
+            route: pathname,
+            creditsCharged: policy.creditCost,
+            decision: "x402_fallback_paid",
+            source: "x402_fallback"
+          });
+          res.writeHead(upstreamRes.status, {
+            "content-type": upstreamRes.headers.get("content-type") || "application/json; charset=utf-8",
+            "x-request-id": requestId,
+            ...settlementHeaders
+          });
+          res.end(text);
+          return;
+        }
 
+        const upstreamRes = await proxyToQuotient(req);
         const text = await upstreamRes.text();
         res.writeHead(upstreamRes.status, {
           "content-type": upstreamRes.headers.get("content-type") || "application/json; charset=utf-8",
@@ -378,21 +602,27 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      if (!requirePayment(req, res)) return;
+      const paymentAuth = await x402Gateway.requirePayment(req, pathname);
+      if (paymentAuth.kind === "deny") {
+        respondWithX402Instructions(res, paymentAuth.response.status, paymentAuth.response, requestId);
+        return;
+      }
       const upstreamRes = await proxyToQuotient(req);
       const text = await upstreamRes.text();
+      const settlementHeaders = await x402Gateway.finalizeSettlement(paymentAuth, text, upstreamRes.status);
       emitUsageLog({
         timestamp: new Date().toISOString(),
         requestId,
         customerId: "x402_fallback_unknown",
         route: pathname,
-        creditsCharged: getRouteCreditCost(pathname),
+        creditsCharged: policy.creditCost,
         decision: "x402_fallback_paid",
         source: "x402_fallback"
       });
       res.writeHead(upstreamRes.status, {
         "content-type": upstreamRes.headers.get("content-type") || "application/json; charset=utf-8",
-        "x-request-id": requestId
+        "x-request-id": requestId,
+        ...settlementHeaders
       });
       res.end(text);
       return;
@@ -405,6 +635,8 @@ const server = http.createServer(async (req, res) => {
     json(res, 500, body);
   }
 });
+
+await x402Gateway.initialize();
 
 server.listen(config.port, () => {
   console.log(`quotient-api-gateway listening on http://localhost:${config.port}`);

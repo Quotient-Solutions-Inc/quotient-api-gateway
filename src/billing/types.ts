@@ -4,12 +4,27 @@ export interface BillingAccount {
   customerId: string;
   apiKeyHash: string;
   stripeCustomerId: string | undefined;
+  planId: string | undefined;
+  stripePriceId: string | undefined;
+  stripeSubscriptionId: string | undefined;
+  cancelAtPeriodEnd: boolean;
   subscriptionStatus: SubscriptionStatus;
   creditsRemaining: number;
   creditsIncluded: number;
   currentPeriodStart: string | undefined;
   currentPeriodEnd: string | undefined;
   updatedAt: string;
+}
+
+export interface BillingPlan {
+  planId: string;
+  name: string;
+  productId: string;
+  priceId: string;
+  amountUsd: number;
+  currency: string;
+  interval: string;
+  includedCredits: number;
 }
 
 export interface CreditUsageEvent {
@@ -27,6 +42,11 @@ export interface StripeCustomerStateUpdate {
   userId: string | undefined;
   apiKeyHash: string;
   stripeCustomerId: string | undefined;
+  planId: string | undefined;
+  stripePriceId: string | undefined;
+  stripeSubscriptionId: string | undefined;
+  cancelAtPeriodEnd: boolean | undefined;
+  creditsIncluded: number | undefined;
   subscriptionStatus: SubscriptionStatus;
   currentPeriodStart: string | undefined;
   currentPeriodEnd: string | undefined;
@@ -35,6 +55,7 @@ export interface StripeCustomerStateUpdate {
 
 export interface BillingStoreLike {
   resolveCustomerFromApiKey(apiKey: string): Promise<{ customerId: string; apiKeyHash: string; userId: string } | null>;
+  getAccount(customerId: string): Promise<BillingAccount | null>;
   getOrCreateAccount(customerId: string, apiKeyHash: string): Promise<BillingAccount>;
   hasActiveSubscription(customerId: string): Promise<boolean>;
   getCreditsRemaining(customerId: string): Promise<number>;
