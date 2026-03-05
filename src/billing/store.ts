@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import type { BillingAccount, BillingStoreLike, StripeCustomerStateUpdate } from "./types.js";
+import type { AutoRechargeSettings, BillingAccount, BillingStoreLike } from "./types.js";
 import type { BillingConfig } from "./config.js";
 import { executeBillingQuery } from "./neo4j.js";
 
@@ -9,6 +9,7 @@ function nowIso(): string {
 
 export class InMemoryBillingStore implements BillingStoreLike {
   private readonly accounts = new Map<string, BillingAccount>();
+  private readonly processedStripeEvents = new Set<string>();
   constructor(private readonly config: BillingConfig) {}
 
   async resolveCustomerFromApiKey(
@@ -28,15 +29,11 @@ export class InMemoryBillingStore implements BillingStoreLike {
       customerId,
       apiKeyHash,
       stripeCustomerId: undefined,
-      planId: undefined,
-      stripePriceId: undefined,
-      stripeSubscriptionId: undefined,
-      cancelAtPeriodEnd: false,
-      subscriptionStatus: "inactive",
+      stripeDefaultPaymentMethodId: undefined,
+      autoRechargeEnabled: false,
+      autoRechargeThreshold: 0,
+      autoRechargePackId: undefined,
       creditsRemaining: 0,
-      creditsIncluded: 0,
-      currentPeriodStart: undefined,
-      currentPeriodEnd: undefined,
       updatedAt: nowIso()
     };
   }
@@ -53,64 +50,85 @@ export class InMemoryBillingStore implements BillingStoreLike {
     return this.accounts.get(customerId) ?? null;
   }
 
-  async hasActiveSubscription(customerId: string): Promise<boolean> {
-    const account = this.accounts.get(customerId);
-    return Boolean(account && account.subscriptionStatus === "active");
-  }
-
   async getCreditsRemaining(customerId: string): Promise<number> {
     const account = this.accounts.get(customerId);
     return account?.creditsRemaining ?? 0;
   }
 
-  async consumeCreditsForRoute(
-    customerId: string,
-    _route: string,
-    routeCost: number,
-    _source: "subscription" | "x402_fallback" = "subscription"
-  ): Promise<{ ok: boolean; remaining: number }> {
-    const account = this.accounts.get(customerId);
-    if (!account || account.subscriptionStatus !== "active") {
-      return { ok: false, remaining: 0 };
+  async recordUsageDebit(input: {
+    customerId: string;
+    route: string;
+    cost: number;
+    requestId: string;
+  }): Promise<{ ok: boolean; remaining: number }> {
+    const account = this.accounts.get(input.customerId);
+    if (!account || account.creditsRemaining < input.cost) {
+      return { ok: false, remaining: account?.creditsRemaining ?? 0 };
     }
-    if (account.creditsRemaining < routeCost) {
-      return { ok: false, remaining: account.creditsRemaining };
-    }
-    account.creditsRemaining -= routeCost;
+    account.creditsRemaining -= input.cost;
     account.updatedAt = nowIso();
     return { ok: true, remaining: account.creditsRemaining };
   }
 
-  async applyStripeState(update: StripeCustomerStateUpdate): Promise<BillingAccount> {
-    const customerId = update.userId ?? `user_${update.apiKeyHash.slice(0, 16)}`;
-    const existing = this.accounts.get(customerId) ?? this.createDefaultAccount(customerId, update.apiKeyHash);
-    existing.subscriptionStatus = update.subscriptionStatus;
-    existing.currentPeriodStart = update.currentPeriodStart;
-    existing.currentPeriodEnd = update.currentPeriodEnd;
-    if (update.planId) {
-      existing.planId = update.planId;
-    }
-    if (update.stripePriceId) {
-      existing.stripePriceId = update.stripePriceId;
-    }
-    if (update.stripeSubscriptionId) {
-      existing.stripeSubscriptionId = update.stripeSubscriptionId;
-    }
-    if (update.cancelAtPeriodEnd !== undefined) {
-      existing.cancelAtPeriodEnd = update.cancelAtPeriodEnd;
-    }
-    if (update.creditsIncluded !== undefined) {
-      existing.creditsIncluded = update.creditsIncluded;
-    }
-    if (update.stripeCustomerId !== undefined) {
-      existing.stripeCustomerId = update.stripeCustomerId;
-    }
-    if (update.replenishCredits && update.subscriptionStatus === "active") {
-      existing.creditsRemaining = update.creditsIncluded ?? existing.creditsIncluded;
-    }
+  async consumeCreditsForRoute(
+    customerId: string,
+    route: string,
+    routeCost: number,
+    _source: "credits" | "x402_fallback" = "credits"
+  ): Promise<{ ok: boolean; remaining: number }> {
+    return this.recordUsageDebit({
+      customerId,
+      route,
+      cost: routeCost,
+      requestId: crypto.randomUUID()
+    });
+  }
+
+  async grantCredits(input: {
+    customerId: string;
+    amount: number;
+    source: "manual_purchase" | "auto_recharge";
+    stripeCustomerId?: string;
+    stripeEventId?: string;
+    stripePaymentIntentId?: string;
+    stripeCheckoutSessionId?: string;
+  }): Promise<BillingAccount> {
+    const existing = this.accounts.get(input.customerId);
+    if (!existing) throw new Error("Billing account not found.");
+    if (input.stripeCustomerId) existing.stripeCustomerId = input.stripeCustomerId;
+    existing.creditsRemaining += input.amount;
     existing.updatedAt = nowIso();
-    this.accounts.set(customerId, existing);
+    this.accounts.set(input.customerId, existing);
     return existing;
+  }
+
+  async hasProcessedStripeEvent(eventId: string): Promise<boolean> {
+    return this.processedStripeEvents.has(eventId);
+  }
+
+  async markStripeEventProcessed(eventId: string): Promise<void> {
+    this.processedStripeEvents.add(eventId);
+  }
+
+  async getAutoRechargeSettings(customerId: string): Promise<AutoRechargeSettings> {
+    const account = this.accounts.get(customerId);
+    const settings: AutoRechargeSettings = {
+      enabled: account?.autoRechargeEnabled === true,
+      thresholdCredits: account?.autoRechargeThreshold ?? 0
+    };
+    if (account?.autoRechargePackId) settings.packId = account.autoRechargePackId;
+    return settings;
+  }
+
+  async setAutoRechargeSettings(customerId: string, settings: AutoRechargeSettings): Promise<BillingAccount> {
+    const account = this.accounts.get(customerId);
+    if (!account) throw new Error("Billing account not found.");
+    account.autoRechargeEnabled = settings.enabled;
+    account.autoRechargeThreshold = Math.max(0, settings.thresholdCredits);
+    account.autoRechargePackId = settings.packId;
+    account.updatedAt = nowIso();
+    this.accounts.set(customerId, account);
+    return account;
   }
 }
 
@@ -143,49 +161,39 @@ export class Neo4jBillingStore implements BillingStoreLike {
   }
 
   async getOrCreateAccount(customerId: string, apiKeyHash: string): Promise<BillingAccount> {
-    const status: "active" | "inactive" = "inactive";
     const credits = 0;
     const rows = await executeBillingQuery<{
       customerId: string;
       apiKeyHash: string;
       stripeCustomerId: string | null;
-      planId: string | null;
-      stripePriceId: string | null;
-      stripeSubscriptionId: string | null;
-      cancelAtPeriodEnd: boolean | null;
-      subscriptionStatus: "active" | "inactive" | "past_due" | "canceled";
+      stripeDefaultPaymentMethodId: string | null;
+      autoRechargeEnabled: boolean | null;
+      autoRechargeThreshold: number | null;
+      autoRechargePackId: string | null;
       creditsRemaining: number;
-      creditsIncluded: number;
-      currentPeriodStart: string | null;
-      currentPeriodEnd: string | null;
       updatedAt: string;
     }>(
       `MATCH (u:User {id: $customerId})
        MERGE (b:BillingAccount {customerId: $customerId})
        ON CREATE SET
          b.apiKeyHash = $apiKeyHash,
-         b.subscriptionStatus = $status,
          b.creditsRemaining = $credits,
-         b.creditsIncluded = 0,
+         b.autoRechargeEnabled = false,
+         b.autoRechargeThreshold = 0,
          b.updatedAt = datetime()
        MERGE (u)-[:HAS_BILLING_ACCOUNT]->(b)
        RETURN b.customerId AS customerId,
               b.apiKeyHash AS apiKeyHash,
               b.stripeCustomerId AS stripeCustomerId,
-              b.planId AS planId,
-              b.stripePriceId AS stripePriceId,
-              b.stripeSubscriptionId AS stripeSubscriptionId,
-              b.cancelAtPeriodEnd AS cancelAtPeriodEnd,
-              b.subscriptionStatus AS subscriptionStatus,
+              b.stripeDefaultPaymentMethodId AS stripeDefaultPaymentMethodId,
+              b.autoRechargeEnabled AS autoRechargeEnabled,
+              b.autoRechargeThreshold AS autoRechargeThreshold,
+              b.autoRechargePackId AS autoRechargePackId,
               COALESCE(b.creditsRemaining, 0) AS creditsRemaining,
-              COALESCE(b.creditsIncluded, 0) AS creditsIncluded,
-              b.currentPeriodStart AS currentPeriodStart,
-              b.currentPeriodEnd AS currentPeriodEnd,
               toString(b.updatedAt) AS updatedAt`,
       {
         customerId,
         apiKeyHash,
-        status,
         credits
       }
     );
@@ -195,26 +203,13 @@ export class Neo4jBillingStore implements BillingStoreLike {
       customerId: row.customerId,
       apiKeyHash: row.apiKeyHash,
       stripeCustomerId: row.stripeCustomerId ?? undefined,
-      planId: row.planId ?? undefined,
-      stripePriceId: row.stripePriceId ?? undefined,
-      stripeSubscriptionId: row.stripeSubscriptionId ?? undefined,
-      cancelAtPeriodEnd: row.cancelAtPeriodEnd === true,
-      subscriptionStatus: row.subscriptionStatus,
+      stripeDefaultPaymentMethodId: row.stripeDefaultPaymentMethodId ?? undefined,
+      autoRechargeEnabled: row.autoRechargeEnabled === true,
+      autoRechargeThreshold: row.autoRechargeThreshold ?? 0,
+      autoRechargePackId: row.autoRechargePackId ?? undefined,
       creditsRemaining: row.creditsRemaining,
-      creditsIncluded: row.creditsIncluded,
-      currentPeriodStart: row.currentPeriodStart ?? undefined,
-      currentPeriodEnd: row.currentPeriodEnd ?? undefined,
       updatedAt: row.updatedAt
     };
-  }
-
-  async hasActiveSubscription(customerId: string): Promise<boolean> {
-    const rows = await executeBillingQuery<{ active: boolean }>(
-      `MATCH (b:BillingAccount {customerId: $customerId})
-       RETURN b.subscriptionStatus = 'active' AS active`,
-      { customerId }
-    );
-    return Boolean(rows[0]?.active);
   }
 
   async getCreditsRemaining(customerId: string): Promise<number> {
@@ -226,75 +221,150 @@ export class Neo4jBillingStore implements BillingStoreLike {
     return rows[0]?.credits ?? 0;
   }
 
-  async consumeCreditsForRoute(
-    customerId: string,
-    _route: string,
-    routeCost: number,
-    _source: "subscription" | "x402_fallback" = "subscription"
-  ): Promise<{ ok: boolean; remaining: number }> {
+  async recordUsageDebit(input: {
+    customerId: string;
+    route: string;
+    cost: number;
+    requestId: string;
+  }): Promise<{ ok: boolean; remaining: number }> {
     const rows = await executeBillingQuery<{ remaining: number }>(
       `MATCH (b:BillingAccount {customerId: $customerId})
-       WHERE b.subscriptionStatus = 'active' AND COALESCE(b.creditsRemaining, 0) >= $cost
+       WHERE COALESCE(b.creditsRemaining, 0) >= $cost
        SET b.creditsRemaining = COALESCE(b.creditsRemaining, 0) - $cost,
            b.updatedAt = datetime()
+       WITH b
+       CREATE (e:BillingLedgerEvent {
+         id: randomUUID(),
+         customerId: $customerId,
+         source: 'api_usage',
+         amount: -$cost,
+         route: $route,
+         requestId: $requestId,
+         balanceAfter: b.creditsRemaining,
+         createdAt: datetime()
+       })
        RETURN b.creditsRemaining AS remaining`,
-      { customerId, cost: routeCost }
+      {
+        customerId: input.customerId,
+        cost: input.cost,
+        route: input.route,
+        requestId: input.requestId
+      }
     );
-    if (rows[0]) {
-      return { ok: true, remaining: rows[0].remaining };
-    }
-    const remaining = await this.getCreditsRemaining(customerId);
-    return { ok: false, remaining };
+    if (rows[0]) return { ok: true, remaining: rows[0].remaining };
+    return { ok: false, remaining: await this.getCreditsRemaining(input.customerId) };
   }
 
-  async applyStripeState(update: StripeCustomerStateUpdate): Promise<BillingAccount> {
-    if (!update.userId) {
-      throw new Error("Stripe update missing user_id metadata.");
-    }
-    const customerId = update.userId;
-    await this.getOrCreateAccount(customerId, update.apiKeyHash);
+  async consumeCreditsForRoute(
+    customerId: string,
+    route: string,
+    routeCost: number,
+    _source: "credits" | "x402_fallback" = "credits"
+  ): Promise<{ ok: boolean; remaining: number }> {
+    return this.recordUsageDebit({
+      customerId,
+      route,
+      cost: routeCost,
+      requestId: crypto.randomUUID()
+    });
+  }
+
+  async grantCredits(input: {
+    customerId: string;
+    amount: number;
+    source: "manual_purchase" | "auto_recharge";
+    stripeCustomerId?: string;
+    stripeEventId?: string;
+    stripePaymentIntentId?: string;
+    stripeCheckoutSessionId?: string;
+  }): Promise<BillingAccount> {
     await executeBillingQuery(
       `MATCH (b:BillingAccount {customerId: $customerId})
-       SET b.subscriptionStatus = $status,
-           b.currentPeriodStart = $periodStart,
-           b.currentPeriodEnd = $periodEnd,
+       SET b.creditsRemaining = COALESCE(b.creditsRemaining, 0) + $amount,
            b.updatedAt = datetime()
        FOREACH (_ IN CASE WHEN $stripeCustomerId IS NULL THEN [] ELSE [1] END |
          SET b.stripeCustomerId = $stripeCustomerId
        )
-       FOREACH (_ IN CASE WHEN $planId IS NULL THEN [] ELSE [1] END |
-         SET b.planId = $planId
-       )
-       FOREACH (_ IN CASE WHEN $stripePriceId IS NULL THEN [] ELSE [1] END |
-         SET b.stripePriceId = $stripePriceId
-       )
-       FOREACH (_ IN CASE WHEN $stripeSubscriptionId IS NULL THEN [] ELSE [1] END |
-         SET b.stripeSubscriptionId = $stripeSubscriptionId
-       )
-       FOREACH (_ IN CASE WHEN $cancelAtPeriodEnd IS NULL THEN [] ELSE [1] END |
-         SET b.cancelAtPeriodEnd = $cancelAtPeriodEnd
-       )
-       FOREACH (_ IN CASE WHEN $creditsIncluded IS NULL THEN [] ELSE [1] END |
-         SET b.creditsIncluded = $creditsIncluded
-       )
-       FOREACH (_ IN CASE WHEN $replenishCredits AND $status = 'active' THEN [1] ELSE [] END |
-         SET b.creditsRemaining = COALESCE($creditsIncluded, b.creditsIncluded, 0)
-       )`,
+       WITH b
+       CREATE (e:BillingLedgerEvent {
+         id: randomUUID(),
+         customerId: $customerId,
+         source: $source,
+         amount: $amount,
+         stripeEventId: $stripeEventId,
+         stripePaymentIntentId: $stripePaymentIntentId,
+         stripeCheckoutSessionId: $stripeCheckoutSessionId,
+         balanceAfter: b.creditsRemaining,
+         createdAt: datetime()
+       })`,
       {
-        customerId,
-        status: update.subscriptionStatus,
-        periodStart: update.currentPeriodStart ?? null,
-        periodEnd: update.currentPeriodEnd ?? null,
-        stripeCustomerId: update.stripeCustomerId ?? null,
-        planId: update.planId ?? null,
-        stripePriceId: update.stripePriceId ?? null,
-        stripeSubscriptionId: update.stripeSubscriptionId ?? null,
-        cancelAtPeriodEnd: update.cancelAtPeriodEnd ?? null,
-        creditsIncluded: update.creditsIncluded ?? null,
-        replenishCredits: update.replenishCredits,
+        customerId: input.customerId,
+        amount: input.amount,
+        source: input.source,
+        stripeCustomerId: input.stripeCustomerId ?? null,
+        stripeEventId: input.stripeEventId ?? null,
+        stripePaymentIntentId: input.stripePaymentIntentId ?? null,
+        stripeCheckoutSessionId: input.stripeCheckoutSessionId ?? null
       }
     );
-    return this.getOrCreateAccount(customerId, update.apiKeyHash);
+    const account = await this.getAccount(input.customerId);
+    if (!account) throw new Error("Billing account not found.");
+    return account;
+  }
+
+  async hasProcessedStripeEvent(eventId: string): Promise<boolean> {
+    const rows = await executeBillingQuery<{ id: string }>(
+      `MATCH (e:ProcessedStripeEvent {id: $eventId}) RETURN e.id AS id LIMIT 1`,
+      { eventId }
+    );
+    return rows.length > 0;
+  }
+
+  async markStripeEventProcessed(eventId: string, customerId: string): Promise<void> {
+    await executeBillingQuery(
+      `MERGE (e:ProcessedStripeEvent {id: $eventId})
+       ON CREATE SET e.customerId = $customerId, e.createdAt = datetime()`,
+      { eventId, customerId }
+    );
+  }
+
+  async getAutoRechargeSettings(customerId: string): Promise<AutoRechargeSettings> {
+    const rows = await executeBillingQuery<{
+      enabled: boolean | null;
+      threshold: number | null;
+      packId: string | null;
+    }>(
+      `MATCH (b:BillingAccount {customerId: $customerId})
+       RETURN b.autoRechargeEnabled AS enabled,
+              b.autoRechargeThreshold AS threshold,
+              b.autoRechargePackId AS packId`,
+      { customerId }
+    );
+    const settings: AutoRechargeSettings = {
+      enabled: rows[0]?.enabled === true,
+      thresholdCredits: rows[0]?.threshold ?? 0
+    };
+    if (rows[0]?.packId) settings.packId = rows[0].packId;
+    return settings;
+  }
+
+  async setAutoRechargeSettings(customerId: string, settings: AutoRechargeSettings): Promise<BillingAccount> {
+    await executeBillingQuery(
+      `MATCH (b:BillingAccount {customerId: $customerId})
+       SET b.autoRechargeEnabled = $enabled,
+           b.autoRechargeThreshold = $threshold,
+           b.autoRechargePackId = $packId,
+           b.updatedAt = datetime()`,
+      {
+        customerId,
+        enabled: settings.enabled,
+        threshold: settings.thresholdCredits,
+        packId: settings.packId ?? null
+      }
+    );
+    const account = await this.getAccount(customerId);
+    if (!account) throw new Error("Billing account not found.");
+    return account;
   }
 
   async getAccount(customerId: string): Promise<BillingAccount | null> {
@@ -302,30 +372,22 @@ export class Neo4jBillingStore implements BillingStoreLike {
       customerId: string;
       apiKeyHash: string;
       stripeCustomerId: string | null;
-      planId: string | null;
-      stripePriceId: string | null;
-      stripeSubscriptionId: string | null;
-      cancelAtPeriodEnd: boolean | null;
-      subscriptionStatus: "active" | "inactive" | "past_due" | "canceled";
+      stripeDefaultPaymentMethodId: string | null;
+      autoRechargeEnabled: boolean | null;
+      autoRechargeThreshold: number | null;
+      autoRechargePackId: string | null;
       creditsRemaining: number;
-      creditsIncluded: number;
-      currentPeriodStart: string | null;
-      currentPeriodEnd: string | null;
       updatedAt: string;
     }>(
       `MATCH (b:BillingAccount {customerId: $customerId})
        RETURN b.customerId AS customerId,
               b.apiKeyHash AS apiKeyHash,
               b.stripeCustomerId AS stripeCustomerId,
-              b.planId AS planId,
-              b.stripePriceId AS stripePriceId,
-              b.stripeSubscriptionId AS stripeSubscriptionId,
-              b.cancelAtPeriodEnd AS cancelAtPeriodEnd,
-              b.subscriptionStatus AS subscriptionStatus,
+              b.stripeDefaultPaymentMethodId AS stripeDefaultPaymentMethodId,
+              b.autoRechargeEnabled AS autoRechargeEnabled,
+              b.autoRechargeThreshold AS autoRechargeThreshold,
+              b.autoRechargePackId AS autoRechargePackId,
               COALESCE(b.creditsRemaining, 0) AS creditsRemaining,
-              COALESCE(b.creditsIncluded, 0) AS creditsIncluded,
-              b.currentPeriodStart AS currentPeriodStart,
-              b.currentPeriodEnd AS currentPeriodEnd,
               toString(b.updatedAt) AS updatedAt`,
       { customerId }
     );
@@ -335,15 +397,11 @@ export class Neo4jBillingStore implements BillingStoreLike {
       customerId: row.customerId,
       apiKeyHash: row.apiKeyHash,
       stripeCustomerId: row.stripeCustomerId ?? undefined,
-      planId: row.planId ?? undefined,
-      stripePriceId: row.stripePriceId ?? undefined,
-      stripeSubscriptionId: row.stripeSubscriptionId ?? undefined,
-      cancelAtPeriodEnd: row.cancelAtPeriodEnd === true,
-      subscriptionStatus: row.subscriptionStatus,
+      stripeDefaultPaymentMethodId: row.stripeDefaultPaymentMethodId ?? undefined,
+      autoRechargeEnabled: row.autoRechargeEnabled === true,
+      autoRechargeThreshold: row.autoRechargeThreshold ?? 0,
+      autoRechargePackId: row.autoRechargePackId ?? undefined,
       creditsRemaining: row.creditsRemaining,
-      creditsIncluded: row.creditsIncluded,
-      currentPeriodStart: row.currentPeriodStart ?? undefined,
-      currentPeriodEnd: row.currentPeriodEnd ?? undefined,
       updatedAt: row.updatedAt
     };
   }

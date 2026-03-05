@@ -12,12 +12,16 @@ export interface BillingConfig {
   internalServiceToken: string | undefined;
   stripeSecretKey: string | undefined;
   stripeWebhookSecret: string | undefined;
-  stripePlanProductMetadataKey: string;
-  stripePlanProductMetadataValue: string;
-  stripePlanCreditsMetadataKey: string;
-  stripePlanCacheTtlSeconds: number;
+  stripePackProductMetadataKey: string;
+  stripePackProductMetadataValue: string;
+  stripePackCreditsMetadataKey: string;
+  stripePackCacheTtlSeconds: number;
   x402: X402Config;
 }
+
+const STRIPE_PACK_PRODUCT_METADATA_KEY = "catalog";
+const STRIPE_PACK_PRODUCT_METADATA_VALUE = "quotient_api_credits";
+const STRIPE_PACK_CREDITS_METADATA_KEY = "credits";
 
 export interface MonetizedRoutePolicy {
   id: "markets" | "intelligence" | "signals";
@@ -71,20 +75,6 @@ function parseEnabledNetworks(input: string | undefined): string[] {
   return Array.from(new Set(networks));
 }
 
-function parseBoolean(input: string | undefined, fallback: boolean): boolean {
-  if (!input) return fallback;
-  return input.trim().toLowerCase() === "true";
-}
-
-function parsePositiveNumber(input: string | undefined, fallback: number): number {
-  if (!input) return fallback;
-  const parsed = Number(input);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new Error("X402_IDEMPOTENCY_TTL_SECONDS must be a positive number.");
-  }
-  return parsed;
-}
-
 function resolvePayToByNetwork(enabledNetworks: readonly string[]): Record<string, string> {
   const configured: Record<string, string | undefined> = {
     "eip155:8453": process.env.X402_PAY_TO_EIP155_8453,
@@ -104,18 +94,6 @@ function resolvePayToByNetwork(enabledNetworks: readonly string[]): Record<strin
 export function loadBillingConfig(): BillingConfig {
   const enabledNetworks = parseEnabledNetworks(process.env.X402_ENABLED_NETWORKS);
   const payToByNetwork = resolvePayToByNetwork(enabledNetworks);
-  const stripePlanProductMetadataKey = (process.env.STRIPE_PLAN_PRODUCT_METADATA_KEY || "catalog").trim();
-  const stripePlanProductMetadataValue = (process.env.STRIPE_PLAN_PRODUCT_METADATA_VALUE || "quotient_api").trim();
-  const stripePlanCreditsMetadataKey = (process.env.STRIPE_PLAN_CREDITS_METADATA_KEY || "included_credits").trim();
-  if (!stripePlanProductMetadataKey) {
-    throw new Error("STRIPE_PLAN_PRODUCT_METADATA_KEY cannot be empty.");
-  }
-  if (!stripePlanProductMetadataValue) {
-    throw new Error("STRIPE_PLAN_PRODUCT_METADATA_VALUE cannot be empty.");
-  }
-  if (!stripePlanCreditsMetadataKey) {
-    throw new Error("STRIPE_PLAN_CREDITS_METADATA_KEY cannot be empty.");
-  }
 
   return {
     stripeCheckoutSuccessUrl: process.env.STRIPE_CHECKOUT_SUCCESS_URL,
@@ -123,16 +101,16 @@ export function loadBillingConfig(): BillingConfig {
     internalServiceToken: process.env.QUOTIENT_INTERNAL_SERVICE_TOKEN,
     stripeSecretKey: process.env.STRIPE_SECRET_KEY,
     stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
-    stripePlanProductMetadataKey,
-    stripePlanProductMetadataValue,
-    stripePlanCreditsMetadataKey,
-    stripePlanCacheTtlSeconds: parsePositiveNumber(process.env.STRIPE_PLAN_CACHE_TTL_SECONDS, 300),
+    stripePackProductMetadataKey: STRIPE_PACK_PRODUCT_METADATA_KEY,
+    stripePackProductMetadataValue: STRIPE_PACK_PRODUCT_METADATA_VALUE,
+    stripePackCreditsMetadataKey: STRIPE_PACK_CREDITS_METADATA_KEY,
+    stripePackCacheTtlSeconds: 5,
     x402: {
       facilitatorUrl: process.env.X402_FACILITATOR_URL || "https://x402.org/facilitator",
       enabledNetworks,
       payToByNetwork,
-      paymentIdRequired: parseBoolean(process.env.X402_PAYMENT_ID_REQUIRED, false),
-      idempotencyTtlSeconds: parsePositiveNumber(process.env.X402_IDEMPOTENCY_TTL_SECONDS, 3600)
+      paymentIdRequired: false,
+      idempotencyTtlSeconds: 3600
     }
   };
 }

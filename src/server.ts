@@ -8,7 +8,7 @@ import path from "node:path";
 import { URL } from "node:url";
 import { Neo4jBillingStore } from "./billing/store.js";
 import { StripeBillingService } from "./billing/stripe.js";
-import { loadBillingConfig, resolveMonetizedRoutePolicy } from "./billing/config.js";
+import { MONETIZED_ROUTE_POLICIES, loadBillingConfig, resolveMonetizedRoutePolicy } from "./billing/config.js";
 import type { BillingStoreLike, CreditUsageEvent } from "./billing/types.js";
 import { X402PaymentGateway } from "./billing/x402.js";
 
@@ -22,9 +22,8 @@ interface ApiError {
   error: string;
   message: string;
 }
-
 const config: Config = {
-  port: Number(process.env.PORT || 8787),
+  port: Number(process.env.PORT || 3001),
   quotientApiBaseUrl: process.env.QUOTIENT_API_BASE_URL || "https://quotient-api.vercel.app",
   gatewaySharedSecret: process.env.QUOTIENT_GATEWAY_SHARED_SECRET || ""
 };
@@ -148,7 +147,7 @@ async function handleCheckoutSessionCreate(req: IncomingMessage, res: ServerResp
     return;
   }
 
-  let body: { userId?: string; privyId?: string; planId?: string; email?: string | null };
+  let body: { userId?: string; privyId?: string; packId?: string; email?: string | null };
   try {
     body = await readJsonBody(req);
   } catch {
@@ -158,22 +157,22 @@ async function handleCheckoutSessionCreate(req: IncomingMessage, res: ServerResp
 
   const userId = body.userId?.trim();
   const privyId = body.privyId?.trim();
-  const planId = body.planId?.trim();
-  if (!userId || !privyId || !planId) {
-    json(res, 422, { error: "invalid_request", message: "userId, privyId, and planId are required." });
+  const packId = body.packId?.trim();
+  if (!userId || !privyId || !packId) {
+    json(res, 422, { error: "invalid_request", message: "userId, privyId, and packId are required." });
     return;
   }
 
   try {
-    const selectedPlan = await stripeBilling.getSelectablePlanById(planId);
-    if (!selectedPlan) {
-      json(res, 422, { error: "invalid_plan", message: `Unknown or unavailable plan '${planId}'.` });
+    const selectedPack = await stripeBilling.getSelectablePackById(packId);
+    if (!selectedPack) {
+      json(res, 422, { error: "invalid_pack", message: `Unknown or unavailable pack '${packId}'.` });
       return;
     }
     const session = await stripeBilling.createCheckoutSession({
       userId,
       privyId,
-      plan: selectedPlan,
+      pack: selectedPack,
       email: typeof body.email === "string" ? body.email : null
     });
     json(res, 200, {
@@ -198,14 +197,36 @@ async function handlePlansList(req: IncomingMessage, res: ServerResponse): Promi
     return;
   }
   try {
-    const plans = await stripeBilling.listSelectablePlans();
-    json(res, 200, { plans });
+    const packs = await stripeBilling.listSelectablePacks();
+    json(res, 200, { packs });
   } catch (error: unknown) {
+    console.log(error);
     json(res, 500, {
-      error: "plans_list_failed",
-      message: error instanceof Error ? error.message : "Failed to list available plans."
+      error: "packs_list_failed",
+      message: error instanceof Error ? error.message : "Failed to list available packs."
     });
   }
+}
+
+function handlePublicPricing(req: IncomingMessage, res: ServerResponse): void {
+  if (req.method !== "GET") {
+    json(res, 405, { error: "method_not_allowed", message: "Use GET." });
+    return;
+  }
+
+  const pricing = MONETIZED_ROUTE_POLICIES.flatMap((policy) =>
+    policy.x402RoutePatterns.map((routePattern) => ({
+      policyId: policy.id,
+      routePattern,
+      creditCost: policy.creditCost,
+      x402AmountUsd: policy.x402Amount
+    }))
+  );
+
+  json(res, 200, {
+    source: "gateway_monetized_route_policies",
+    pricing
+  });
 }
 
 async function handleCheckoutSessionLookup(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -234,7 +255,35 @@ async function handleCheckoutSessionLookup(req: IncomingMessage, res: ServerResp
   }
 }
 
-async function handleSubscriptionCancel(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleAutoRechargeGet(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (req.method !== "GET") {
+    json(res, 405, { error: "method_not_allowed", message: "Use GET." });
+    return;
+  }
+  if (!isInternalServiceAuthorized(req)) {
+    json(res, 401, { error: "unauthorized", message: "Missing or invalid internal service token." });
+    return;
+  }
+  const reqUrl = new URL(req.url || "/", "http://localhost");
+  const userId = reqUrl.searchParams.get("userId")?.trim();
+  if (!userId) {
+    json(res, 422, { error: "invalid_request", message: "userId is required." });
+    return;
+  }
+  const account = await billingStore.getAccount(userId);
+  if (!account) {
+    json(res, 404, { error: "not_found", message: "Billing account not found." });
+    return;
+  }
+  const settings = await billingStore.getAutoRechargeSettings(userId);
+  json(res, 200, {
+    enabled: settings.enabled,
+    thresholdCredits: settings.thresholdCredits,
+    packId: settings.packId ?? null
+  });
+}
+
+async function handleAutoRechargeSet(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (req.method !== "POST") {
     json(res, 405, { error: "method_not_allowed", message: "Use POST." });
     return;
@@ -243,7 +292,7 @@ async function handleSubscriptionCancel(req: IncomingMessage, res: ServerRespons
     json(res, 401, { error: "unauthorized", message: "Missing or invalid internal service token." });
     return;
   }
-  let body: { userId?: string };
+  let body: { userId?: string; enabled?: boolean; thresholdCredits?: number; packId?: string | null };
   try {
     body = await readJsonBody(req);
   } catch {
@@ -260,55 +309,68 @@ async function handleSubscriptionCancel(req: IncomingMessage, res: ServerRespons
     json(res, 404, { error: "not_found", message: "Billing account not found." });
     return;
   }
-  if (!account.stripeCustomerId && !account.stripeSubscriptionId) {
-    json(res, 422, { error: "missing_stripe_subscription", message: "No Stripe subscription found." });
+  const enabled = body.enabled === true;
+  const thresholdCredits = Number.isFinite(body.thresholdCredits) ? Math.max(0, Math.floor(body.thresholdCredits || 0)) : 0;
+  const packId = typeof body.packId === "string" && body.packId.trim() ? body.packId.trim() : undefined;
+  if (enabled && !packId) {
+    json(res, 422, { error: "invalid_request", message: "packId is required when auto-recharge is enabled." });
+    return;
+  }
+  if (enabled && !account.stripeCustomerId) {
+    json(res, 422, { error: "missing_payment_method", message: "User must complete at least one checkout before enabling auto-recharge." });
     return;
   }
   try {
-    const cancelInput: { stripeCustomerId?: string; stripeSubscriptionId?: string } = {};
-    if (account.stripeCustomerId) cancelInput.stripeCustomerId = account.stripeCustomerId;
-    if (account.stripeSubscriptionId) cancelInput.stripeSubscriptionId = account.stripeSubscriptionId;
-    const canceled = await stripeBilling.cancelSubscriptionAtPeriodEnd({
-      ...cancelInput
-    });
-    const updated = await billingStore.applyStripeState({
-      userId,
-      apiKeyHash: account.apiKeyHash,
-      stripeCustomerId: account.stripeCustomerId,
-      planId: account.planId,
-      stripePriceId: account.stripePriceId,
-      stripeSubscriptionId: canceled.subscriptionId,
-      cancelAtPeriodEnd: canceled.cancelAtPeriodEnd,
-      creditsIncluded: account.creditsIncluded,
-      subscriptionStatus:
-        canceled.status === "active"
-          ? "active"
-          : canceled.status === "past_due"
-            ? "past_due"
-            : canceled.status === "canceled"
-              ? "canceled"
-              : "inactive",
-      currentPeriodStart: account.currentPeriodStart,
-      currentPeriodEnd: canceled.currentPeriodEnd,
-      replenishCredits: false
-    });
+    const settings = packId
+      ? { enabled, thresholdCredits, packId }
+      : { enabled, thresholdCredits };
+    const updated = await billingStore.setAutoRechargeSettings(userId, settings);
     json(res, 200, {
       ok: true,
       customerId: updated.customerId,
-      planId: updated.planId ?? null,
-      subscriptionStatus: updated.subscriptionStatus,
-      cancelAtPeriodEnd: updated.cancelAtPeriodEnd,
-      currentPeriodEnd: updated.currentPeriodEnd ?? null
+      enabled: updated.autoRechargeEnabled,
+      thresholdCredits: updated.autoRechargeThreshold,
+      packId: updated.autoRechargePackId ?? null
     });
   } catch (error: unknown) {
     json(res, 500, {
-      error: "subscription_cancel_failed",
-      message: error instanceof Error ? error.message : "Failed to cancel subscription."
+      error: "auto_recharge_update_failed",
+      message: error instanceof Error ? error.message : "Failed to update auto-recharge settings."
     });
   }
 }
 
-async function canUseSubscriptionCredits(
+async function maybeTriggerAutoRecharge(customerId: string, requestId: string): Promise<void> {
+  const account = await billingStore.getAccount(customerId);
+  if (!account || !account.autoRechargeEnabled) return;
+  if (!account.stripeCustomerId || !account.autoRechargePackId) return;
+  if (account.creditsRemaining >= account.autoRechargeThreshold) return;
+  const pack = await stripeBilling.getSelectablePackById(account.autoRechargePackId);
+  if (!pack) return;
+  const charge = await stripeBilling.createAutoRechargeCharge({
+    customerId,
+    stripeCustomerId: account.stripeCustomerId,
+    pack
+  });
+  if (charge.status !== "succeeded") return;
+  await billingStore.grantCredits({
+    customerId,
+    amount: charge.credits,
+    source: "auto_recharge",
+    stripePaymentIntentId: charge.paymentIntentId
+  });
+  emitUsageLog({
+    timestamp: new Date().toISOString(),
+    requestId,
+    customerId,
+    route: "auto_recharge",
+    creditsCharged: -charge.credits,
+    decision: "credits_allowed",
+    source: "credits"
+  });
+}
+
+async function canUseCredits(
   apiKey: string,
   pathname: string,
   routeCreditCost: number,
@@ -320,33 +382,31 @@ async function canUseSubscriptionCredits(
   }
   const { customerId, apiKeyHash } = resolved;
   await billingStore.getOrCreateAccount(customerId, apiKeyHash);
-
-  if (!(await billingStore.hasActiveSubscription(customerId))) {
-    const remaining = await billingStore.getCreditsRemaining(customerId);
-    emitUsageLog({
-      timestamp: new Date().toISOString(),
-      requestId,
-      customerId,
-      route: pathname,
-      creditsCharged: 0,
-      creditsRemaining: remaining,
-      decision: "subscription_inactive",
-      source: "subscription"
-    });
-    return { allowed: false, customerId, remaining };
+  const consumed = await billingStore.recordUsageDebit({
+    customerId,
+    route: pathname,
+    cost: routeCreditCost,
+    requestId
+  });
+  if (!consumed.ok) {
+    try {
+      await maybeTriggerAutoRecharge(customerId, requestId);
+    } catch {
+      // Auto-recharge failure should not break request handling.
+    }
   }
-  const consumed = await billingStore.consumeCreditsForRoute(customerId, pathname, routeCreditCost, "subscription");
+  const refreshedRemaining = consumed.ok ? consumed.remaining : await billingStore.getCreditsRemaining(customerId);
   emitUsageLog({
     timestamp: new Date().toISOString(),
     requestId,
     customerId,
     route: pathname,
     creditsCharged: consumed.ok ? routeCreditCost : 0,
-    creditsRemaining: consumed.remaining,
-    decision: consumed.ok ? "subscription_allowed" : "subscription_insufficient_credits",
-    source: "subscription"
+    creditsRemaining: refreshedRemaining,
+    decision: consumed.ok ? "credits_allowed" : "credits_insufficient",
+    source: "credits"
   });
-  return { allowed: consumed.ok, customerId, remaining: consumed.remaining };
+  return { allowed: consumed.ok, customerId, remaining: refreshedRemaining };
 }
 
 function respondWithX402Instructions(
@@ -398,26 +458,37 @@ async function handleStripeWebhook(req: IncomingMessage, res: ServerResponse): P
     return;
   }
 
-  const update = stripeBilling.toStateUpdateFromEvent(event);
-  if (!update) {
+  const grant = stripeBilling.toCreditGrantFromEvent(event);
+  if (!grant) {
     json(res, 200, { ok: true, ignored: true, eventType: event.type });
     return;
   }
 
   try {
-    const account = await billingStore.applyStripeState(update);
-    let provisionedApiKey = false;
-    if (update.userId && update.subscriptionStatus === "active") {
-      await provisionPaidUserFromStripe(update.userId, requestIdFrom(req));
-      provisionedApiKey = true;
+    const alreadyProcessed = await billingStore.hasProcessedStripeEvent(grant.stripeEventId);
+    if (alreadyProcessed) {
+      json(res, 200, { ok: true, duplicate: true, eventType: event.type });
+      return;
     }
+    await provisionPaidUserFromStripe(grant.userId, requestIdFrom(req));
+    await billingStore.getOrCreateAccount(grant.userId, grant.apiKeyHash);
+    const grantInput = {
+      customerId: grant.userId,
+      amount: grant.credits,
+      source: grant.source,
+      stripeEventId: grant.stripeEventId,
+      ...(grant.stripeCustomerId ? { stripeCustomerId: grant.stripeCustomerId } : {}),
+      ...(grant.stripePaymentIntentId ? { stripePaymentIntentId: grant.stripePaymentIntentId } : {}),
+      ...(grant.stripeCheckoutSessionId ? { stripeCheckoutSessionId: grant.stripeCheckoutSessionId } : {})
+    } as const;
+    const account = await billingStore.grantCredits(grantInput);
+    await billingStore.markStripeEventProcessed(grant.stripeEventId, grant.userId);
     json(res, 200, {
       ok: true,
       eventType: event.type,
       customerId: account.customerId,
-      subscriptionStatus: account.subscriptionStatus,
       creditsRemaining: account.creditsRemaining,
-      provisionedApiKey
+      credited: grant.credits
     });
   } catch (error: unknown) {
     json(res, 500, {
@@ -450,17 +521,15 @@ async function handleBillingSummary(req: IncomingMessage, res: ServerResponse): 
       return;
     }
     const account = await billingStore.getOrCreateAccount(resolved.customerId, resolved.apiKeyHash);
+    const autoRecharge = await billingStore.getAutoRechargeSettings(resolved.customerId);
     json(res, 200, {
       customerId: account.customerId,
-      planId: account.planId ?? null,
-      stripePriceId: account.stripePriceId ?? null,
-      stripeSubscriptionId: account.stripeSubscriptionId ?? null,
-      subscriptionStatus: account.subscriptionStatus,
-      cancelAtPeriodEnd: account.cancelAtPeriodEnd,
       creditsRemaining: account.creditsRemaining,
-      creditsIncluded: account.creditsIncluded,
-      currentPeriodStart: account.currentPeriodStart ?? null,
-      currentPeriodEnd: account.currentPeriodEnd ?? null
+      autoRecharge: {
+        enabled: autoRecharge.enabled,
+        thresholdCredits: autoRecharge.thresholdCredits,
+        packId: autoRecharge.packId ?? null
+      }
     }, {
       "x-request-id": requestId
     });
@@ -475,6 +544,44 @@ async function handleBillingSummary(req: IncomingMessage, res: ServerResponse): 
 }
 
 const server = http.createServer(async (req, res) => {
+  const startedAtMs = Date.now();
+  const requestId = requestIdFrom(req);
+  const method = req.method || "UNKNOWN";
+  const rawUrl = req.url || "/";
+  const pathname = (() => {
+    try {
+      return new URL(rawUrl, "http://localhost").pathname;
+    } catch {
+      return rawUrl;
+    }
+  })();
+
+  res.on("finish", () => {
+    const forwardedFor = req.headers["x-forwarded-for"];
+    const clientIp =
+      typeof forwardedFor === "string"
+        ? forwardedFor.split(",")[0]?.trim()
+        : req.socket.remoteAddress || "unknown";
+    const userAgent = req.headers["user-agent"];
+    console.log(
+      JSON.stringify({
+        type: "gateway_request",
+        timestamp: new Date().toISOString(),
+        requestId,
+        method,
+        pathname,
+        statusCode: res.statusCode,
+        durationMs: Date.now() - startedAtMs,
+        clientIp,
+        userAgent: typeof userAgent === "string" ? userAgent : undefined
+      })
+    );
+  });
+
+  if (!res.hasHeader("x-request-id")) {
+    res.setHeader("x-request-id", requestId);
+  }
+
   try {
     if (!req.url) {
       json(res, 400, { error: "invalid_request", message: "Missing URL." });
@@ -518,8 +625,21 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (pathname === "/api/internal/billing/subscription/cancel") {
-      await handleSubscriptionCancel(req, res);
+    if (pathname === "/api/public/pricing") {
+      handlePublicPricing(req, res);
+      return;
+    }
+
+    if (pathname === "/api/internal/billing/auto-recharge") {
+      if (req.method === "GET") {
+        await handleAutoRechargeGet(req, res);
+        return;
+      }
+      if (req.method === "POST") {
+        await handleAutoRechargeSet(req, res);
+        return;
+      }
+      json(res, 405, { error: "method_not_allowed", message: "Use GET or POST." });
       return;
     }
 
@@ -544,7 +664,7 @@ const server = http.createServer(async (req, res) => {
       if (hasClientKey) {
         let billing;
         try {
-          billing = await canUseSubscriptionCredits(clientKey.trim(), pathname, policy.creditCost, requestId);
+          billing = await canUseCredits(clientKey.trim(), pathname, policy.creditCost, requestId);
         } catch (error: unknown) {
           json(res, 500, {
             error: "billing_identity_mapping_error",
@@ -564,29 +684,16 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         if (!billing.allowed) {
-          const paymentAuth = await x402Gateway.requirePayment(req, pathname);
-          if (paymentAuth.kind === "deny") {
-            respondWithX402Instructions(res, paymentAuth.response.status, paymentAuth.response, requestId);
-            return;
-          }
-          const upstreamRes = await proxyToQuotient(req);
-          const text = await upstreamRes.text();
-          const settlementHeaders = await x402Gateway.finalizeSettlement(paymentAuth, text, upstreamRes.status);
-          emitUsageLog({
-            timestamp: new Date().toISOString(),
-            requestId,
-            customerId: billing.customerId,
-            route: pathname,
-            creditsCharged: policy.creditCost,
-            decision: "x402_fallback_paid",
-            source: "x402_fallback"
+          json(res, 403, {
+            error: "insufficient_credits",
+            message: "Insufficient credits for this route.",
+            billing: {
+              required_credits: policy.creditCost,
+              credits_remaining: billing.remaining
+            }
+          }, {
+            "x-request-id": requestId
           });
-          res.writeHead(upstreamRes.status, {
-            "content-type": upstreamRes.headers.get("content-type") || "application/json; charset=utf-8",
-            "x-request-id": requestId,
-            ...settlementHeaders
-          });
-          res.end(text);
           return;
         }
 

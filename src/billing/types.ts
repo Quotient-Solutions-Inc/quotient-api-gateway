@@ -1,30 +1,23 @@
-export type SubscriptionStatus = "active" | "inactive" | "past_due" | "canceled";
-
 export interface BillingAccount {
   customerId: string;
   apiKeyHash: string;
   stripeCustomerId: string | undefined;
-  planId: string | undefined;
-  stripePriceId: string | undefined;
-  stripeSubscriptionId: string | undefined;
-  cancelAtPeriodEnd: boolean;
-  subscriptionStatus: SubscriptionStatus;
+  stripeDefaultPaymentMethodId: string | undefined;
+  autoRechargeEnabled: boolean;
+  autoRechargeThreshold: number;
+  autoRechargePackId: string | undefined;
   creditsRemaining: number;
-  creditsIncluded: number;
-  currentPeriodStart: string | undefined;
-  currentPeriodEnd: string | undefined;
   updatedAt: string;
 }
 
-export interface BillingPlan {
-  planId: string;
+export interface BillingPack {
+  packId: string;
   name: string;
   productId: string;
   priceId: string;
   amountUsd: number;
   currency: string;
-  interval: string;
-  includedCredits: number;
+  credits: number;
 }
 
 export interface CreditUsageEvent {
@@ -34,36 +27,78 @@ export interface CreditUsageEvent {
   route: string;
   creditsCharged: number;
   creditsRemaining?: number;
-  decision: "subscription_allowed" | "subscription_insufficient_credits" | "subscription_inactive" | "x402_fallback_paid";
-  source: "subscription" | "x402_fallback";
+  decision: "credits_allowed" | "credits_insufficient" | "x402_fallback_paid";
+  source: "credits" | "x402_fallback";
 }
 
-export interface StripeCustomerStateUpdate {
-  userId: string | undefined;
+export type CreditLedgerSource = "manual_purchase" | "auto_recharge" | "api_usage";
+
+export interface CreditLedgerEntry {
+  customerId: string;
+  source: CreditLedgerSource;
+  amount: number;
+  balanceAfter: number;
+  requestId?: string;
+  route?: string;
+  stripeEventId?: string;
+  stripePaymentIntentId?: string;
+  stripeCheckoutSessionId?: string;
+  createdAt: string;
+}
+
+export interface AutoRechargeSettings {
+  enabled: boolean;
+  thresholdCredits: number;
+  packId?: string;
+}
+
+export interface StripeCreditGrant {
+  userId: string;
   apiKeyHash: string;
-  stripeCustomerId: string | undefined;
-  planId: string | undefined;
-  stripePriceId: string | undefined;
-  stripeSubscriptionId: string | undefined;
-  cancelAtPeriodEnd: boolean | undefined;
-  creditsIncluded: number | undefined;
-  subscriptionStatus: SubscriptionStatus;
-  currentPeriodStart: string | undefined;
-  currentPeriodEnd: string | undefined;
-  replenishCredits: boolean;
+  stripeCustomerId?: string;
+  stripePaymentIntentId?: string;
+  stripeCheckoutSessionId?: string;
+  stripeEventId: string;
+  credits: number;
+  source: "manual_purchase" | "auto_recharge";
+  packId?: string;
+}
+
+export interface AutoRechargeExecutionResult {
+  triggered: boolean;
+  credited: boolean;
+  creditsAdded: number;
+  reason?: string;
 }
 
 export interface BillingStoreLike {
   resolveCustomerFromApiKey(apiKey: string): Promise<{ customerId: string; apiKeyHash: string; userId: string } | null>;
   getAccount(customerId: string): Promise<BillingAccount | null>;
   getOrCreateAccount(customerId: string, apiKeyHash: string): Promise<BillingAccount>;
-  hasActiveSubscription(customerId: string): Promise<boolean>;
   getCreditsRemaining(customerId: string): Promise<number>;
+  recordUsageDebit(input: {
+    customerId: string;
+    route: string;
+    cost: number;
+    requestId: string;
+  }): Promise<{ ok: boolean; remaining: number }>;
   consumeCreditsForRoute(
     customerId: string,
     route: string,
     routeCost: number,
-    source?: "subscription" | "x402_fallback"
+    source?: "credits" | "x402_fallback"
   ): Promise<{ ok: boolean; remaining: number }>;
-  applyStripeState(update: StripeCustomerStateUpdate): Promise<BillingAccount>;
+  grantCredits(input: {
+    customerId: string;
+    amount: number;
+    source: "manual_purchase" | "auto_recharge";
+    stripeCustomerId?: string;
+    stripeEventId?: string;
+    stripePaymentIntentId?: string;
+    stripeCheckoutSessionId?: string;
+  }): Promise<BillingAccount>;
+  hasProcessedStripeEvent(eventId: string): Promise<boolean>;
+  markStripeEventProcessed(eventId: string, customerId: string): Promise<void>;
+  getAutoRechargeSettings(customerId: string): Promise<AutoRechargeSettings>;
+  setAutoRechargeSettings(customerId: string, settings: AutoRechargeSettings): Promise<BillingAccount>;
 }

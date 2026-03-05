@@ -7,14 +7,15 @@ x402-style monetization and policy gateway in front of `quotient-api`.
 - Returns `402 Payment Required` for protected routes when payment proof is missing.
 - Proxies read endpoints (`/api/v1/markets*`) to Quotient API.
 - Supports dual-path access:
-  - user key via `x-quotient-api-key` for subscription-credit metering in the gateway
-  - x402 paid fallback via `PAYMENT-SIGNATURE` when key is missing or out of credits
+  - user key via `x-quotient-api-key` for credit-balance metering in the gateway
+  - x402 paid fallback via `PAYMENT-SIGNATURE` when key is missing
 - Authenticates upstream to `quotient-api` using gateway service auth (`x-quotient-gateway-secret`).
-- Handles Stripe subscription webhook events at `/api/billing/stripe/webhook`.
+- Handles Stripe credit purchase webhook events at `/api/billing/stripe/webhook`.
 - Exposes internal checkout/session endpoints for portal orchestration:
   - `GET /api/internal/billing/plans`
   - `POST /api/internal/billing/checkout-session`
   - `GET /api/internal/billing/checkout-session/status?sessionId=...`
+  - `GET/POST /api/internal/billing/auto-recharge`
 - Serves a public gateway skill artifact at `/public/skills/quotient-api-gateway/SKILL.md`.
 
 ## Route Pricing Policy
@@ -26,6 +27,7 @@ Monetized public route policy is centralized in `src/billing/config.ts` via a si
   - x402 amount
 - Gateway billing and x402 challenge logic both resolve from this same policy.
 - Strict mode is enforced: if a `/api/v1/*` route has no policy entry, gateway returns `422 unpriced_route`.
+- Public pricing view is exposed at `GET /api/public/pricing` for docs/portal consumers.
 
 ## x402 Headers
 
@@ -42,7 +44,7 @@ npm run build
 node dist/server.js
 ```
 
-Server starts at `http://localhost:8787` by default.
+Server starts at `http://localhost:3001` by default.
 
 ## Request Sequence Diagrams
 
@@ -81,7 +83,7 @@ sequenceDiagram
     Gateway-->>Agent: 200 + payload
 ```
 
-### 3) Stripe renewal replenishes credits
+### 3) Stripe purchase adds credits
 
 ```mermaid
 sequenceDiagram
@@ -89,9 +91,9 @@ sequenceDiagram
     participant Gateway as QuotientAPIGateway
     participant Neo4j as Neo4j
 
-    Stripe->>Gateway: POST /api/billing/stripe/webhook (invoice.paid)
-    Gateway->>Gateway: Verify signature + parse metadata.user_id
-    Gateway->>Neo4j: Update BillingAccount status and replenish credits
+    Stripe->>Gateway: POST /api/billing/stripe/webhook (checkout.session.completed)
+    Gateway->>Gateway: Verify signature + parse metadata.user_id + metadata.credits
+    Gateway->>Neo4j: Add credits to BillingAccount and append ledger event
     Neo4j-->>Gateway: Updated balance/state
     Gateway-->>Stripe: 200 OK
 ```
@@ -104,46 +106,58 @@ sequenceDiagram
 - `X402_FACILITATOR_URL`
 - `X402_ENABLED_NETWORKS` (CAIP-2 list, e.g. `eip155:84532,eip155:8453`)
 - `X402_PAY_TO_EIP155_84532`, `X402_PAY_TO_EIP155_8453`
-- `X402_PAYMENT_ID_REQUIRED`, `X402_IDEMPOTENCY_TTL_SECONDS`
 - `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`
 - `STRIPE_CHECKOUT_SUCCESS_URL`, `STRIPE_CHECKOUT_CANCEL_URL`
-- `STRIPE_PLAN_PRODUCT_METADATA_KEY`, `STRIPE_PLAN_PRODUCT_METADATA_VALUE`
-- `STRIPE_PLAN_CREDITS_METADATA_KEY`, `STRIPE_PLAN_CACHE_TTL_SECONDS`
-- `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` (required)
+- `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASS` (required)
 
 See `.env.example` for full list.
 
 ## Local E2E
 
-Detailed instructions: `docs/local-e2e-testing.md`.
+Detailed instructions: [Local E2E Testing](docs/local-e2e-testing.md).
 
 Quick run:
 
 ```bash
-# Real subscribed user key to test subscription path
-export QUOTIENT_USER_API_KEY=qt_your_real_key
-bash scripts/e2e-local.sh
+export TEST_API_KEY=qt_your_real_key
+npm run e2e:test-api-key
+```
+
+Automated x402 paid request flow:
+
+```bash
+export TEST_X402_PRIVATE_KEY=0xyour_test_wallet_private_key
+export TEST_X402_NETWORK=eip155:84532
+npm run e2e:test-x402-payment
 ```
 
 ## Stripe Setup Runbook
 
-See `docs/stripe-registration-runbook.md`.
+See [Stripe Registration Runbook](docs/stripe-registration-runbook.md).
 
-## Stripe Plan Onboarding Checklist
+## Stripe Webhook Events
 
-To add a new Stripe plan that the gateway auto-discovers:
+Configure your Stripe webhook endpoint (`POST /api/billing/stripe/webhook`) to subscribe to:
 
-1. Create a Stripe product and recurring price.
+- `checkout.session.completed`
+- `payment_intent.succeeded`
+
+These are the events used for credit grants (manual purchase and auto-recharge). Other Stripe events are ignored with `200`.
+
+## Stripe Credit Pack Onboarding Checklist
+
+To add a new Stripe credit pack that the gateway auto-discovers:
+
+1. Create a Stripe product and one-time price.
 2. On the product metadata, set:
-   - `catalog=quotient_api` (must match `STRIPE_PLAN_PRODUCT_METADATA_VALUE`)
-   - optional: `plan_id=<stable_plan_id>` (for predictable plan IDs)
-3. On the price metadata, set:
-   - `included_credits=<positive integer>` (required for plan pickup)
-   - optional: `plan_id=<stable_plan_id>` (overrides product-level `plan_id`)
-4. Ensure the price is active + recurring.
-5. Restart gateway (or wait for `STRIPE_PLAN_CACHE_TTL_SECONDS`), then verify:
+   - `catalog=quotient_api_credits` (hardcoded gateway catalog filter)
+   - optional: `pack_id=<stable_pack_id>` (for predictable pack IDs)
+3. On the product metadata, also set:
+   - `credits=<positive integer>` (required for pack pickup)
+4. Ensure the price is active + one-time.
+5. Restart gateway (or wait for the 300-second plan cache TTL), then verify:
    - call `GET /api/internal/billing/plans` with internal bearer token
-   - confirm new plan includes expected `planId`, `amountUsd`, `interval`, `includedCredits`
+   - confirm new pack includes expected `packId`, `amountUsd`, `credits`
 
 ## x402 Rollout Phases
 

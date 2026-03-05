@@ -8,9 +8,11 @@
     "@x402/core": "^2.5.0",
     "@x402/evm": "^2.5.0",
     "@x402/extensions": "^2.5.0",
+    "@x402/fetch": "^2.5.0",
     "dotenv": "^17.3.1",
     "neo4j-driver": "^5.28.1",
-    "stripe": "^18.4.0"
+    "stripe": "^18.4.0",
+    "viem": "^2.47.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -18,7 +20,9 @@
     "dev": "tsx watch src/server.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test dist/**/*.test.js",
-    "e2e:local": "bash scripts/e2e-local.sh"
+    "e2e:local": "tsx test-scripts/e2e-api-key-request.ts",
+    "e2e:test-api-key": "tsx test-scripts/e2e-api-key-request.ts",
+    "e2e:test-x402-payment": "tsx test-scripts/e2e-x402-payment.ts"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",

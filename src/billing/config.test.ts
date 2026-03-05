@@ -6,13 +6,7 @@ const ENV_KEYS = [
   "X402_ENABLED_NETWORKS",
   "X402_PAY_TO_EIP155_8453",
   "X402_PAY_TO_EIP155_84532",
-  "X402_PAYMENT_ID_REQUIRED",
-  "X402_IDEMPOTENCY_TTL_SECONDS",
-  "X402_FACILITATOR_URL",
-  "STRIPE_PLAN_PRODUCT_METADATA_KEY",
-  "STRIPE_PLAN_PRODUCT_METADATA_VALUE",
-  "STRIPE_PLAN_CREDITS_METADATA_KEY",
-  "STRIPE_PLAN_CACHE_TTL_SECONDS"
+  "X402_FACILITATOR_URL"
 ] as const;
 
 function withTempEnv(values: Partial<Record<(typeof ENV_KEYS)[number], string>>, run: () => void): void {
@@ -44,26 +38,20 @@ test("loadBillingConfig parses enabled x402 networks and payTo map", () => {
       X402_ENABLED_NETWORKS: "eip155:84532,eip155:8453",
       X402_PAY_TO_EIP155_84532: "0x1111111111111111111111111111111111111111",
       X402_PAY_TO_EIP155_8453: "0x2222222222222222222222222222222222222222",
-      X402_PAYMENT_ID_REQUIRED: "true",
-      X402_IDEMPOTENCY_TTL_SECONDS: "1800",
-      X402_FACILITATOR_URL: "https://x402.org/facilitator",
-      STRIPE_PLAN_PRODUCT_METADATA_KEY: "catalog",
-      STRIPE_PLAN_PRODUCT_METADATA_VALUE: "quotient_api",
-      STRIPE_PLAN_CREDITS_METADATA_KEY: "included_credits",
-      STRIPE_PLAN_CACHE_TTL_SECONDS: "120"
+      X402_FACILITATOR_URL: "https://x402.org/facilitator"
     },
     () => {
       const config = loadBillingConfig();
       assert.deepEqual(config.x402.enabledNetworks, ["eip155:84532", "eip155:8453"]);
       assert.equal(config.x402.payToByNetwork["eip155:84532"], "0x1111111111111111111111111111111111111111");
       assert.equal(config.x402.payToByNetwork["eip155:8453"], "0x2222222222222222222222222222222222222222");
-      assert.equal(config.x402.paymentIdRequired, true);
-      assert.equal(config.x402.idempotencyTtlSeconds, 1800);
+      assert.equal(config.x402.paymentIdRequired, false);
+      assert.equal(config.x402.idempotencyTtlSeconds, 3600);
       assert.equal(config.x402.facilitatorUrl, "https://x402.org/facilitator");
-      assert.equal(config.stripePlanProductMetadataKey, "catalog");
-      assert.equal(config.stripePlanProductMetadataValue, "quotient_api");
-      assert.equal(config.stripePlanCreditsMetadataKey, "included_credits");
-      assert.equal(config.stripePlanCacheTtlSeconds, 120);
+      assert.equal(config.stripePackProductMetadataKey, "catalog");
+      assert.equal(config.stripePackProductMetadataValue, "quotient_api_credits");
+      assert.equal(config.stripePackCreditsMetadataKey, "credits");
+      assert.equal(config.stripePackCacheTtlSeconds, 5);
     }
   );
 });
