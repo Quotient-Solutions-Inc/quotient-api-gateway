@@ -33,6 +33,7 @@ const stripeBilling = new StripeBillingService(billingConfig);
 const x402Gateway = new X402PaymentGateway(billingConfig);
 const thisDir = path.dirname(fileURLToPath(import.meta.url));
 const publicSkillPath = path.resolve(thisDir, "../public/skills/quotient-api-gateway/SKILL.md");
+const MIN_PURCHASE_UNITS = 5;
 
 if (!config.gatewaySharedSecret) {
   console.error("Missing QUOTIENT_GATEWAY_SHARED_SECRET");
@@ -147,7 +148,7 @@ async function handleCheckoutSessionCreate(req: IncomingMessage, res: ServerResp
     return;
   }
 
-  let body: { userId?: string; privyId?: string; packId?: string; email?: string | null };
+  let body: { userId?: string; privyId?: string; units?: number; email?: string | null };
   try {
     body = await readJsonBody(req);
   } catch {
@@ -157,22 +158,20 @@ async function handleCheckoutSessionCreate(req: IncomingMessage, res: ServerResp
 
   const userId = body.userId?.trim();
   const privyId = body.privyId?.trim();
-  const packId = body.packId?.trim();
-  if (!userId || !privyId || !packId) {
-    json(res, 422, { error: "invalid_request", message: "userId, privyId, and packId are required." });
+  const units = Number.isFinite(body.units) ? Math.floor(Number(body.units)) : NaN;
+  if (!userId || !privyId || !Number.isInteger(units) || units < MIN_PURCHASE_UNITS) {
+    json(res, 422, {
+      error: "invalid_request",
+      message: `userId, privyId, and integer units >= ${MIN_PURCHASE_UNITS} are required.`
+    });
     return;
   }
 
   try {
-    const selectedPack = await stripeBilling.getSelectablePackById(packId);
-    if (!selectedPack) {
-      json(res, 422, { error: "invalid_pack", message: `Unknown or unavailable pack '${packId}'.` });
-      return;
-    }
     const session = await stripeBilling.createCheckoutSession({
       userId,
       privyId,
-      pack: selectedPack,
+      units,
       email: typeof body.email === "string" ? body.email : null
     });
     json(res, 200, {
@@ -279,7 +278,7 @@ async function handleAutoRechargeGet(req: IncomingMessage, res: ServerResponse):
   json(res, 200, {
     enabled: settings.enabled,
     thresholdCredits: settings.thresholdCredits,
-    packId: settings.packId ?? null
+    units: settings.units ?? null
   });
 }
 
@@ -292,7 +291,7 @@ async function handleAutoRechargeSet(req: IncomingMessage, res: ServerResponse):
     json(res, 401, { error: "unauthorized", message: "Missing or invalid internal service token." });
     return;
   }
-  let body: { userId?: string; enabled?: boolean; thresholdCredits?: number; packId?: string | null };
+  let body: { userId?: string; enabled?: boolean; thresholdCredits?: number; units?: number | null };
   try {
     body = await readJsonBody(req);
   } catch {
@@ -311,9 +310,12 @@ async function handleAutoRechargeSet(req: IncomingMessage, res: ServerResponse):
   }
   const enabled = body.enabled === true;
   const thresholdCredits = Number.isFinite(body.thresholdCredits) ? Math.max(0, Math.floor(body.thresholdCredits || 0)) : 0;
-  const packId = typeof body.packId === "string" && body.packId.trim() ? body.packId.trim() : undefined;
-  if (enabled && !packId) {
-    json(res, 422, { error: "invalid_request", message: "packId is required when auto-recharge is enabled." });
+  const units = Number.isFinite(body.units) ? Math.floor(Number(body.units)) : undefined;
+  if (enabled && (!Number.isInteger(units) || (units ?? 0) < MIN_PURCHASE_UNITS)) {
+    json(res, 422, {
+      error: "invalid_request",
+      message: `units is required and must be an integer >= ${MIN_PURCHASE_UNITS} when auto-recharge is enabled.`
+    });
     return;
   }
   let stripeCustomerId = account.stripeCustomerId;
@@ -333,8 +335,8 @@ async function handleAutoRechargeSet(req: IncomingMessage, res: ServerResponse):
     return;
   }
   try {
-    const settings = packId
-      ? { enabled, thresholdCredits, packId }
+    const settings = typeof units === "number"
+      ? { enabled, thresholdCredits, units }
       : { enabled, thresholdCredits };
     const updated = await billingStore.setAutoRechargeSettings(userId, settings);
     json(res, 200, {
@@ -342,7 +344,7 @@ async function handleAutoRechargeSet(req: IncomingMessage, res: ServerResponse):
       customerId: updated.customerId,
       enabled: updated.autoRechargeEnabled,
       thresholdCredits: updated.autoRechargeThreshold,
-      packId: updated.autoRechargePackId ?? null
+      units: updated.autoRechargeUnits ?? null
     });
   } catch (error: unknown) {
     json(res, 500, {
@@ -355,31 +357,25 @@ async function handleAutoRechargeSet(req: IncomingMessage, res: ServerResponse):
 async function maybeTriggerAutoRecharge(customerId: string, requestId: string): Promise<void> {
   const account = await billingStore.getAccount(customerId);
   if (!account || !account.autoRechargeEnabled) return;
-  if (!account.stripeCustomerId || !account.autoRechargePackId) return;
+  if (!account.stripeCustomerId || !account.autoRechargeUnits || account.autoRechargeUnits < MIN_PURCHASE_UNITS) return;
   if (account.creditsRemaining >= account.autoRechargeThreshold) return;
-  const pack = await stripeBilling.getSelectablePackById(account.autoRechargePackId);
-  if (!pack) return;
   const charge = await stripeBilling.createAutoRechargeCharge({
     customerId,
     stripeCustomerId: account.stripeCustomerId,
-    pack
+    units: account.autoRechargeUnits
   });
-  if (charge.status !== "succeeded") return;
-  await billingStore.grantCredits({
-    customerId,
-    amount: charge.credits,
-    source: "auto_recharge",
-    stripePaymentIntentId: charge.paymentIntentId
-  });
-  emitUsageLog({
-    timestamp: new Date().toISOString(),
-    requestId,
-    customerId,
-    route: "auto_recharge",
-    creditsCharged: -charge.credits,
-    decision: "credits_allowed",
-    source: "credits"
-  });
+  console.log(
+    JSON.stringify({
+      type: "auto_recharge_intent_created",
+      timestamp: new Date().toISOString(),
+      requestId,
+      customerId,
+      stripePaymentIntentId: charge.paymentIntentId,
+      status: charge.status,
+      packId: charge.packId,
+      credits: charge.credits
+    })
+  );
 }
 
 async function canUseCredits(
@@ -411,17 +407,26 @@ async function canUseCredits(
       consumed.remaining < threshold;
 
 
-    console.log("crossedBelowThreshold", crossedBelowThreshold);
-    console.log("account.autoRechargeEnabled", account.autoRechargeEnabled);
-    console.log("previousRemaining", previousRemaining);
-    console.log("threshold", threshold);
-    console.log("consumed.remaining", consumed.remaining);
     if (crossedBelowThreshold) {
       attemptedRecharge = true;
       try {
         await maybeTriggerAutoRecharge(customerId, requestId);
       } catch (e) {
-        console.error(e);
+        const message = e instanceof Error ? e.message : String(e);
+        console.error(
+          JSON.stringify({
+            type: "auto_recharge_failure",
+            timestamp: new Date().toISOString(),
+            requestId,
+            customerId,
+            route: pathname,
+            trigger: "threshold_crossed",
+            threshold,
+            previousRemaining,
+            remainingAfterDebit: consumed.remaining,
+            error: message
+          })
+        );
         // Auto-recharge failure should not break request handling.
       }
     }
@@ -429,7 +434,21 @@ async function canUseCredits(
     attemptedRecharge = true;
     try {
       await maybeTriggerAutoRecharge(customerId, requestId);
-    } catch {
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      console.error(
+        JSON.stringify({
+          type: "auto_recharge_failure",
+          timestamp: new Date().toISOString(),
+          requestId,
+          customerId,
+          route: pathname,
+          trigger: "insufficient_credits",
+          requiredCredits: routeCreditCost,
+          remainingBeforeRechargeAttempt: consumed.remaining,
+          error: message
+        })
+      );
       // Auto-recharge failure should not break request handling.
     }
   }
@@ -570,7 +589,7 @@ async function handleBillingSummary(req: IncomingMessage, res: ServerResponse): 
       autoRecharge: {
         enabled: autoRecharge.enabled,
         thresholdCredits: autoRecharge.thresholdCredits,
-        packId: autoRecharge.packId ?? null
+        units: autoRecharge.units ?? null
       }
     }, {
       "x-request-id": requestId

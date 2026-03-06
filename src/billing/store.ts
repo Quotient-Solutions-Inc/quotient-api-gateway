@@ -40,7 +40,7 @@ export class Neo4jBillingStore implements BillingStoreLike {
       stripeDefaultPaymentMethodId: string | null;
       autoRechargeEnabled: boolean | null;
       autoRechargeThreshold: number | null;
-      autoRechargePackId: string | null;
+      autoRechargeUnits: number | null;
       creditsRemaining: number;
       updatedAt: string;
     }>(
@@ -59,7 +59,7 @@ export class Neo4jBillingStore implements BillingStoreLike {
               b.stripeDefaultPaymentMethodId AS stripeDefaultPaymentMethodId,
               b.autoRechargeEnabled AS autoRechargeEnabled,
               b.autoRechargeThreshold AS autoRechargeThreshold,
-              b.autoRechargePackId AS autoRechargePackId,
+              b.autoRechargeUnits AS autoRechargeUnits,
               COALESCE(b.creditsRemaining, 0) AS creditsRemaining,
               toString(b.updatedAt) AS updatedAt`,
       {
@@ -77,7 +77,7 @@ export class Neo4jBillingStore implements BillingStoreLike {
       stripeDefaultPaymentMethodId: row.stripeDefaultPaymentMethodId ?? undefined,
       autoRechargeEnabled: row.autoRechargeEnabled === true,
       autoRechargeThreshold: row.autoRechargeThreshold ?? 0,
-      autoRechargePackId: row.autoRechargePackId ?? undefined,
+      autoRechargeUnits: row.autoRechargeUnits ?? undefined,
       creditsRemaining: row.creditsRemaining,
       updatedAt: row.updatedAt
     };
@@ -215,19 +215,26 @@ export class Neo4jBillingStore implements BillingStoreLike {
     const rows = await executeBillingQuery<{
       enabled: boolean | null;
       threshold: number | null;
-      packId: string | null;
+      units: number | null;
+      legacyPackId: string | null;
     }>(
       `MATCH (b:BillingAccount {customerId: $customerId})
        RETURN b.autoRechargeEnabled AS enabled,
               b.autoRechargeThreshold AS threshold,
-              b.autoRechargePackId AS packId`,
+              b.autoRechargeUnits AS units,
+              b.autoRechargePackId AS legacyPackId`,
       { customerId }
     );
+    const hasLegacyPack = Boolean(rows[0]?.legacyPackId);
+    const normalizedUnits =
+      typeof rows[0]?.units === "number" && Number.isFinite(rows[0]?.units)
+        ? Math.max(0, Math.floor(rows[0].units))
+        : undefined;
     const settings: AutoRechargeSettings = {
-      enabled: rows[0]?.enabled === true,
+      enabled: rows[0]?.enabled === true && !hasLegacyPack && typeof normalizedUnits === "number" && normalizedUnits >= 5,
       thresholdCredits: rows[0]?.threshold ?? 0
     };
-    if (rows[0]?.packId) settings.packId = rows[0].packId;
+    if (typeof normalizedUnits === "number") settings.units = normalizedUnits;
     return settings;
   }
 
@@ -236,13 +243,14 @@ export class Neo4jBillingStore implements BillingStoreLike {
       `MATCH (b:BillingAccount {customerId: $customerId})
        SET b.autoRechargeEnabled = $enabled,
            b.autoRechargeThreshold = $threshold,
-           b.autoRechargePackId = $packId,
+           b.autoRechargeUnits = $units,
+           b.autoRechargePackId = null,
            b.updatedAt = datetime()`,
       {
         customerId,
         enabled: settings.enabled,
         threshold: settings.thresholdCredits,
-        packId: settings.packId ?? null
+        units: settings.units ?? null
       }
     );
     const account = await this.getAccount(customerId);
@@ -258,7 +266,7 @@ export class Neo4jBillingStore implements BillingStoreLike {
       stripeDefaultPaymentMethodId: string | null;
       autoRechargeEnabled: boolean | null;
       autoRechargeThreshold: number | null;
-      autoRechargePackId: string | null;
+      autoRechargeUnits: number | null;
       creditsRemaining: number;
       updatedAt: string;
     }>(
@@ -269,7 +277,7 @@ export class Neo4jBillingStore implements BillingStoreLike {
               b.stripeDefaultPaymentMethodId AS stripeDefaultPaymentMethodId,
               b.autoRechargeEnabled AS autoRechargeEnabled,
               b.autoRechargeThreshold AS autoRechargeThreshold,
-              b.autoRechargePackId AS autoRechargePackId,
+              b.autoRechargeUnits AS autoRechargeUnits,
               COALESCE(b.creditsRemaining, 0) AS creditsRemaining,
               toString(b.updatedAt) AS updatedAt`,
       { customerId }
@@ -283,7 +291,7 @@ export class Neo4jBillingStore implements BillingStoreLike {
       stripeDefaultPaymentMethodId: row.stripeDefaultPaymentMethodId ?? undefined,
       autoRechargeEnabled: row.autoRechargeEnabled === true,
       autoRechargeThreshold: row.autoRechargeThreshold ?? 0,
-      autoRechargePackId: row.autoRechargePackId ?? undefined,
+      autoRechargeUnits: row.autoRechargeUnits ?? undefined,
       creditsRemaining: row.creditsRemaining,
       updatedAt: row.updatedAt
     };

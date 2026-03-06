@@ -90,7 +90,7 @@ export class StripeBillingService {
   async createCheckoutSession(input: {
     userId: string;
     privyId: string;
-    pack: BillingPack;
+    units: number;
     email?: string | null;
   }): Promise<{ id: string; url: string }> {
     if (!this.stripe) {
@@ -100,18 +100,21 @@ export class StripeBillingService {
       throw new Error("Missing checkout success/cancel URLs.");
     }
 
+    const unitPack = await this.getUnitPack();
+    const credits = unitPack.credits * input.units;
     const params: Stripe.Checkout.SessionCreateParams = {
       mode: "payment",
       customer_creation: "always",
-      line_items: [{ price: input.pack.priceId, quantity: 1 }],
+      line_items: [{ price: unitPack.priceId, quantity: input.units }],
       success_url: `${this.config.stripeCheckoutSuccessUrl}?sessionId={CHECKOUT_SESSION_ID}`,
       cancel_url: this.config.stripeCheckoutCancelUrl,
       metadata: {
         user_id: input.userId,
         privy_id: input.privyId,
-        pack_id: input.pack.packId,
-        stripe_price_id: input.pack.priceId,
-        credits: String(input.pack.credits),
+        pack_id: unitPack.packId,
+        stripe_price_id: unitPack.priceId,
+        credits: String(credits),
+        units: String(input.units),
         purchase_type: "manual_purchase"
       },
       payment_intent_data: {
@@ -119,9 +122,10 @@ export class StripeBillingService {
         metadata: {
           user_id: input.userId,
           privy_id: input.privyId,
-          pack_id: input.pack.packId,
-          stripe_price_id: input.pack.priceId,
-          credits: String(input.pack.credits),
+          pack_id: unitPack.packId,
+          stripe_price_id: unitPack.priceId,
+          credits: String(credits),
+          units: String(input.units),
           purchase_type: "manual_purchase"
         }
       }
@@ -140,11 +144,13 @@ export class StripeBillingService {
   async createAutoRechargeCharge(input: {
     customerId: string;
     stripeCustomerId: string;
-    pack: BillingPack;
+    units: number;
   }): Promise<{ paymentIntentId: string; status: string; credits: number; packId: string }> {
     if (!this.stripe) {
       throw new Error("Stripe billing is not configured.");
     }
+    const unitPack = await this.getUnitPack();
+    const credits = unitPack.credits * input.units;
     const paymentMethodId = await this.resolveReusablePaymentMethodId(input.stripeCustomerId);
     if (!paymentMethodId) {
       throw new Error(
@@ -152,25 +158,26 @@ export class StripeBillingService {
       );
     }
     const intent = await this.stripe.paymentIntents.create({
-      amount: Math.round(input.pack.amountUsd * 100),
-      currency: input.pack.currency,
+      amount: Math.round(unitPack.amountUsd * 100 * input.units),
+      currency: unitPack.currency,
       customer: input.stripeCustomerId,
       payment_method: paymentMethodId,
       off_session: true,
       confirm: true,
       metadata: {
         user_id: input.customerId,
-        pack_id: input.pack.packId,
-        stripe_price_id: input.pack.priceId,
-        credits: String(input.pack.credits),
+        pack_id: unitPack.packId,
+        stripe_price_id: unitPack.priceId,
+        credits: String(credits),
+        units: String(input.units),
         purchase_type: "auto_recharge"
       }
     });
     return {
       paymentIntentId: intent.id,
       status: intent.status,
-      credits: input.pack.credits,
-      packId: input.pack.packId
+      credits,
+      packId: unitPack.packId
     };
   }
 
@@ -198,6 +205,17 @@ export class StripeBillingService {
       limit: 1
     });
     return cardPaymentMethods.data[0]?.id ?? null;
+  }
+
+  private async getUnitPack(): Promise<BillingPack> {
+    const packs = await this.listSelectablePacks();
+    const unitPack = packs.find((pack) => pack.amountUsd === 1 && pack.currency.toLowerCase() === "usd");
+    if (!unitPack) {
+      throw new Error(
+        "No active $1 USD Stripe unit pack found. Configure a one-time Stripe price at $1 with required metadata."
+      );
+    }
+    return unitPack;
   }
 
   async getCheckoutSession(sessionId: string): Promise<{

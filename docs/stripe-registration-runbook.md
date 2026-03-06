@@ -11,23 +11,25 @@ When API credits are unavailable, gateway falls back to x402 v2 payment verifica
 - Webhook registration and verification
 - Post-setup validation
 
-## 1) Create Stripe Credit Pack (Manual)
+## 1) Create Stripe Credit Unit Item
 
-The gateway credit-pack catalog is pulled directly from Stripe Prices + Products.
-A pack is discoverable only when metadata matches the gateway filters.
+The gateway pulls Stripe prices/products directly and expects one active `$1 USD` one-time item.
+Users can purchase/recharge with integer dollar units (minimum 5 units / $5).
+Credits are granted as:
 
-Create one-time packs that map to your gateway credit bundles
-(example: `$20` for `1000` credits).
+- `creditsGranted = units * credits`
+
+Where `credits` is product metadata and represents credits per `$1`.
 
 ### Stripe Dashboard steps
 
 1. Go to `Stripe Dashboard -> Product catalog -> Add product`.
-2. Create a product (example name: `Starter 20`).
+2. Create a product (example name: `Credits Unit`).
 3. In the product metadata, add:
    - `catalog=quotient_api_credits` (hardcoded gateway catalog filter)
-   - `credits=1000` (must be a positive integer string)
-   - optional but recommended: `pack_id=starter_1000` (stable app-facing id)
-4. Add a one-time price for that product.
+   - `credits=100` (example: 100 credits per $1 unit)
+   - required: `pack_id=credits_unit` (stable id; mandatory for reloads)
+4. Add a one-time price for that product at exactly `$1.00 USD`.
 5. Save product and price.
 
 ### Metadata contract for pack discovery
@@ -37,23 +39,22 @@ The gateway currently uses:
 - product metadata `catalog=quotient_api_credits`
 - credits metadata key `credits`
 
-Required for a pack to appear in `GET /api/internal/billing/plans`:
+Required for the unit item to appear in `GET /api/internal/billing/plans`:
 
 - Product metadata contains `catalog=quotient_api_credits`
 - Price is `active`, `one_time`, and has a non-null amount
 - `credits` exists on product metadata and parses to `> 0`
 
-Pack ID resolution order:
+Pack ID requirement:
 
-1. `product.metadata.pack_id`
-2. `price.lookup_key`
-3. fallback `${product.id}:${price.id}`
+- `product.metadata.pack_id` must be present and non-empty
+- no fallback pack id source is supported
 
 Record after creation:
 
 - product ID (`prod_...`)
 - price ID (`price_...`)
-- resolved pack ID (for checkout payload `packId`)
+- resolved pack ID (for traceability/logs)
 
 Billing plan metadata and route credit costs are code-defined in gateway billing config.
 
@@ -64,10 +65,9 @@ After creating/updating products:
 1. Restart gateway (or wait for the 300-second plan cache TTL).
 2. Call:
    - `GET /api/internal/billing/plans` with internal bearer token.
-3. Confirm the new pack appears with expected:
-   - `packId`
-   - `amountUsd`
-   - `credits`
+3. Confirm one unit item appears with:
+   - `amountUsd=1`
+   - expected `credits` per $1 unit
 
 ## 2) Configure Gateway Environment
 
@@ -125,7 +125,7 @@ Expected checkout payload:
 {
   "userId": "canonical_user_id",
   "privyId": "did:privy:...",
-  "packId": "starter_1000",
+  "units": 5,
   "email": "optional@example.com"
 }
 ```

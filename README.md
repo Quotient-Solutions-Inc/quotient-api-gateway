@@ -144,20 +144,26 @@ Configure your Stripe webhook endpoint (`POST /api/billing/stripe/webhook`) to s
 
 These are the events used for credit grants (manual purchase and auto-recharge). Other Stripe events are ignored with `200`.
 
-## Stripe Credit Pack Onboarding Checklist
+## Stripe Credit Unit Onboarding Checklist
 
-To add a new Stripe credit pack that the gateway auto-discovers:
+The gateway now expects a single Stripe unit price for credit purchases.
+Users choose integer dollar units at checkout/auto-recharge time, with a minimum of 5 units.
+Credits granted are computed as:
 
-1. Create a Stripe product and one-time price.
+- `units * credits_per_dollar`
+
+To configure the Stripe unit item:
+
+1. Create (or update) one Stripe product and one-time price at exactly `$1.00 USD`.
 2. On the product metadata, set:
    - `catalog=quotient_api_credits` (hardcoded gateway catalog filter)
-   - optional: `pack_id=<stable_pack_id>` (for predictable pack IDs)
+   - required: `pack_id=<stable_pack_id>` (mandatory for reloads)
 3. On the product metadata, also set:
-   - `credits=<positive integer>` (required for pack pickup)
-4. Ensure the price is active + one-time.
+   - `credits=<positive integer>` (credits granted per $1 unit)
+4. Ensure the price is active + one-time and in `usd`.
 5. Restart gateway (or wait for the 300-second plan cache TTL), then verify:
    - call `GET /api/internal/billing/plans` with internal bearer token
-   - confirm new pack includes expected `packId`, `amountUsd`, `credits`
+   - confirm the discovered unit item has `amountUsd=1` and expected `credits`
 
 ## x402 Rollout Phases
 

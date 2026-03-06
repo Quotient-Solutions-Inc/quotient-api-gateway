@@ -5,7 +5,7 @@ export interface BillingAccount {
   stripeDefaultPaymentMethodId: string | undefined;
   autoRechargeEnabled: boolean;
   autoRechargeThreshold: number;
-  autoRechargePackId: string | undefined;
+  autoRechargeUnits: number | undefined;
   creditsRemaining: number;
   updatedAt: string;
 }
@@ -49,7 +49,7 @@ export interface CreditLedgerEntry {
 export interface AutoRechargeSettings {
   enabled: boolean;
   thresholdCredits: number;
-  packId?: string;
+  units?: number;
 }
 
 export interface StripeCreditGrant {
