@@ -393,21 +393,44 @@ async function canUseCredits(
     return { allowed: false, invalidKey: true, customerId: "invalid_api_key", remaining: 0 };
   }
   const { customerId, apiKeyHash } = resolved;
-  await billingStore.getOrCreateAccount(customerId, apiKeyHash);
+  const account = await billingStore.getOrCreateAccount(customerId, apiKeyHash);
   const consumed = await billingStore.recordUsageDebit({
     customerId,
     route: pathname,
     cost: routeCreditCost,
     requestId
   });
-  if (!consumed.ok) {
+
+  let attemptedRecharge = false;
+  if (consumed.ok) {
+    const threshold = account.autoRechargeThreshold;
+    const previousRemaining = consumed.remaining + routeCreditCost;
+    const crossedBelowThreshold =
+      account.autoRechargeEnabled &&
+      previousRemaining >= threshold &&
+      consumed.remaining < threshold;
+
+    if (crossedBelowThreshold) {
+      attemptedRecharge = true;
+      try {
+        await maybeTriggerAutoRecharge(customerId, requestId);
+      } catch {
+        // Auto-recharge failure should not break request handling.
+      }
+    }
+  } else {
+    attemptedRecharge = true;
     try {
       await maybeTriggerAutoRecharge(customerId, requestId);
     } catch {
       // Auto-recharge failure should not break request handling.
     }
   }
-  const refreshedRemaining = consumed.ok ? consumed.remaining : await billingStore.getCreditsRemaining(customerId);
+
+  const refreshedRemaining =
+    consumed.ok && !attemptedRecharge
+      ? consumed.remaining
+      : await billingStore.getCreditsRemaining(customerId);
   emitUsageLog({
     timestamp: new Date().toISOString(),
     requestId,
