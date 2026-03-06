@@ -102,6 +102,7 @@ export class StripeBillingService {
 
     const params: Stripe.Checkout.SessionCreateParams = {
       mode: "payment",
+      customer_creation: "always",
       line_items: [{ price: input.pack.priceId, quantity: 1 }],
       success_url: `${this.config.stripeCheckoutSuccessUrl}?sessionId={CHECKOUT_SESSION_ID}`,
       cancel_url: this.config.stripeCheckoutCancelUrl,
@@ -184,6 +185,46 @@ export class StripeBillingService {
       customerId: typeof session.customer === "string" ? session.customer : null,
       paymentIntentId: typeof session.payment_intent === "string" ? session.payment_intent : null
     };
+  }
+
+  async findCustomerIdForUser(userId: string): Promise<string | null> {
+    if (!this.stripe) {
+      throw new Error("Stripe billing is not configured.");
+    }
+
+    let startingAfterSession: string | undefined;
+    for (let pageCount = 0; pageCount < 5; pageCount += 1) {
+      const page = await this.stripe.checkout.sessions.list({
+        limit: 100,
+        ...(startingAfterSession ? { starting_after: startingAfterSession } : {})
+      });
+      for (const session of page.data) {
+        if (session.metadata?.user_id !== userId) continue;
+        if (typeof session.customer === "string") return session.customer;
+      }
+      if (!page.has_more || page.data.length === 0) break;
+      const last = page.data[page.data.length - 1];
+      if (!last) break;
+      startingAfterSession = last.id;
+    }
+
+    let startingAfterIntent: string | undefined;
+    for (let pageCount = 0; pageCount < 5; pageCount += 1) {
+      const page = await this.stripe.paymentIntents.list({
+        limit: 100,
+        ...(startingAfterIntent ? { starting_after: startingAfterIntent } : {})
+      });
+      for (const intent of page.data) {
+        if (intent.metadata?.user_id !== userId) continue;
+        if (typeof intent.customer === "string") return intent.customer;
+      }
+      if (!page.has_more || page.data.length === 0) break;
+      const last = page.data[page.data.length - 1];
+      if (!last) break;
+      startingAfterIntent = last.id;
+    }
+
+    return null;
   }
 
   parseWebhookEvent(rawBody: Buffer, signatureHeader: string | undefined): Stripe.Event {

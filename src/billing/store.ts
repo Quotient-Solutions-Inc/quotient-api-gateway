@@ -3,135 +3,6 @@ import type { AutoRechargeSettings, BillingAccount, BillingStoreLike } from "./t
 import type { BillingConfig } from "./config.js";
 import { executeBillingQuery } from "./neo4j.js";
 
-function nowIso(): string {
-  return new Date().toISOString();
-}
-
-export class InMemoryBillingStore implements BillingStoreLike {
-  private readonly accounts = new Map<string, BillingAccount>();
-  private readonly processedStripeEvents = new Set<string>();
-  constructor(private readonly config: BillingConfig) {}
-
-  async resolveCustomerFromApiKey(
-    apiKey: string
-  ): Promise<{ customerId: string; apiKeyHash: string; userId: string } | null> {
-    const apiKeyHash = crypto.createHash("sha256").update(apiKey).digest("hex");
-    const userId = `user_${apiKeyHash.slice(0, 16)}`;
-    return {
-      customerId: userId,
-      apiKeyHash,
-      userId
-    };
-  }
-
-  private createDefaultAccount(customerId: string, apiKeyHash: string): BillingAccount {
-    return {
-      customerId,
-      apiKeyHash,
-      stripeCustomerId: undefined,
-      stripeDefaultPaymentMethodId: undefined,
-      autoRechargeEnabled: false,
-      autoRechargeThreshold: 0,
-      autoRechargePackId: undefined,
-      creditsRemaining: 0,
-      updatedAt: nowIso()
-    };
-  }
-
-  async getOrCreateAccount(customerId: string, apiKeyHash: string): Promise<BillingAccount> {
-    const existing = this.accounts.get(customerId);
-    if (existing) return existing;
-    const created = this.createDefaultAccount(customerId, apiKeyHash);
-    this.accounts.set(customerId, created);
-    return created;
-  }
-
-  async getAccount(customerId: string): Promise<BillingAccount | null> {
-    return this.accounts.get(customerId) ?? null;
-  }
-
-  async getCreditsRemaining(customerId: string): Promise<number> {
-    const account = this.accounts.get(customerId);
-    return account?.creditsRemaining ?? 0;
-  }
-
-  async recordUsageDebit(input: {
-    customerId: string;
-    route: string;
-    cost: number;
-    requestId: string;
-  }): Promise<{ ok: boolean; remaining: number }> {
-    const account = this.accounts.get(input.customerId);
-    if (!account || account.creditsRemaining < input.cost) {
-      return { ok: false, remaining: account?.creditsRemaining ?? 0 };
-    }
-    account.creditsRemaining -= input.cost;
-    account.updatedAt = nowIso();
-    return { ok: true, remaining: account.creditsRemaining };
-  }
-
-  async consumeCreditsForRoute(
-    customerId: string,
-    route: string,
-    routeCost: number,
-    _source: "credits" | "x402_fallback" = "credits"
-  ): Promise<{ ok: boolean; remaining: number }> {
-    return this.recordUsageDebit({
-      customerId,
-      route,
-      cost: routeCost,
-      requestId: crypto.randomUUID()
-    });
-  }
-
-  async grantCredits(input: {
-    customerId: string;
-    amount: number;
-    source: "manual_purchase" | "auto_recharge";
-    stripeCustomerId?: string;
-    stripeEventId?: string;
-    stripePaymentIntentId?: string;
-    stripeCheckoutSessionId?: string;
-  }): Promise<BillingAccount> {
-    const existing = this.accounts.get(input.customerId);
-    if (!existing) throw new Error("Billing account not found.");
-    if (input.stripeCustomerId) existing.stripeCustomerId = input.stripeCustomerId;
-    existing.creditsRemaining += input.amount;
-    existing.updatedAt = nowIso();
-    this.accounts.set(input.customerId, existing);
-    return existing;
-  }
-
-  async hasProcessedStripeEvent(eventId: string): Promise<boolean> {
-    return this.processedStripeEvents.has(eventId);
-  }
-
-  async markStripeEventProcessed(eventId: string): Promise<void> {
-    this.processedStripeEvents.add(eventId);
-  }
-
-  async getAutoRechargeSettings(customerId: string): Promise<AutoRechargeSettings> {
-    const account = this.accounts.get(customerId);
-    const settings: AutoRechargeSettings = {
-      enabled: account?.autoRechargeEnabled === true,
-      thresholdCredits: account?.autoRechargeThreshold ?? 0
-    };
-    if (account?.autoRechargePackId) settings.packId = account.autoRechargePackId;
-    return settings;
-  }
-
-  async setAutoRechargeSettings(customerId: string, settings: AutoRechargeSettings): Promise<BillingAccount> {
-    const account = this.accounts.get(customerId);
-    if (!account) throw new Error("Billing account not found.");
-    account.autoRechargeEnabled = settings.enabled;
-    account.autoRechargeThreshold = Math.max(0, settings.thresholdCredits);
-    account.autoRechargePackId = settings.packId;
-    account.updatedAt = nowIso();
-    this.accounts.set(customerId, account);
-    return account;
-  }
-}
-
 export class Neo4jBillingStore implements BillingStoreLike {
   constructor(private readonly config: BillingConfig) {}
 
@@ -326,6 +197,18 @@ export class Neo4jBillingStore implements BillingStoreLike {
        ON CREATE SET e.customerId = $customerId, e.createdAt = datetime()`,
       { eventId, customerId }
     );
+  }
+
+  async setStripeCustomerId(customerId: string, stripeCustomerId: string): Promise<BillingAccount> {
+    await executeBillingQuery(
+      `MATCH (b:BillingAccount {customerId: $customerId})
+       SET b.stripeCustomerId = $stripeCustomerId,
+           b.updatedAt = datetime()`,
+      { customerId, stripeCustomerId }
+    );
+    const account = await this.getAccount(customerId);
+    if (!account) throw new Error("Billing account not found.");
+    return account;
   }
 
   async getAutoRechargeSettings(customerId: string): Promise<AutoRechargeSettings> {

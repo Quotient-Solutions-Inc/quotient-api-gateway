@@ -99,6 +99,7 @@ export interface BillingStoreLike {
   }): Promise<BillingAccount>;
   hasProcessedStripeEvent(eventId: string): Promise<boolean>;
   markStripeEventProcessed(eventId: string, customerId: string): Promise<void>;
+  setStripeCustomerId(customerId: string, stripeCustomerId: string): Promise<BillingAccount>;
   getAutoRechargeSettings(customerId: string): Promise<AutoRechargeSettings>;
   setAutoRechargeSettings(customerId: string, settings: AutoRechargeSettings): Promise<BillingAccount>;
 }

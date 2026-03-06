@@ -316,7 +316,19 @@ async function handleAutoRechargeSet(req: IncomingMessage, res: ServerResponse):
     json(res, 422, { error: "invalid_request", message: "packId is required when auto-recharge is enabled." });
     return;
   }
-  if (enabled && !account.stripeCustomerId) {
+  let stripeCustomerId = account.stripeCustomerId;
+  if (enabled && !stripeCustomerId) {
+    try {
+      const discoveredCustomerId = await stripeBilling.findCustomerIdForUser(userId);
+      if (discoveredCustomerId) {
+        const updated = await billingStore.setStripeCustomerId(userId, discoveredCustomerId);
+        stripeCustomerId = updated.stripeCustomerId;
+      }
+    } catch {
+      // Preserve existing behavior if Stripe lookup fails.
+    }
+  }
+  if (enabled && !stripeCustomerId) {
     json(res, 422, { error: "missing_payment_method", message: "User must complete at least one checkout before enabling auto-recharge." });
     return;
   }
