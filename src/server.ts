@@ -410,11 +410,18 @@ async function canUseCredits(
       previousRemaining >= threshold &&
       consumed.remaining < threshold;
 
+
+    console.log("crossedBelowThreshold", crossedBelowThreshold);
+    console.log("account.autoRechargeEnabled", account.autoRechargeEnabled);
+    console.log("previousRemaining", previousRemaining);
+    console.log("threshold", threshold);
+    console.log("consumed.remaining", consumed.remaining);
     if (crossedBelowThreshold) {
       attemptedRecharge = true;
       try {
         await maybeTriggerAutoRecharge(customerId, requestId);
-      } catch {
+      } catch (e) {
+        console.error(e);
         // Auto-recharge failure should not break request handling.
       }
     }

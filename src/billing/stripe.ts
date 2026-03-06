@@ -145,10 +145,17 @@ export class StripeBillingService {
     if (!this.stripe) {
       throw new Error("Stripe billing is not configured.");
     }
+    const paymentMethodId = await this.resolveReusablePaymentMethodId(input.stripeCustomerId);
+    if (!paymentMethodId) {
+      throw new Error(
+        "No reusable Stripe payment method found for this customer. Complete a Stripe checkout with a savable card to enable auto-recharge."
+      );
+    }
     const intent = await this.stripe.paymentIntents.create({
       amount: Math.round(input.pack.amountUsd * 100),
       currency: input.pack.currency,
       customer: input.stripeCustomerId,
+      payment_method: paymentMethodId,
       off_session: true,
       confirm: true,
       metadata: {
@@ -165,6 +172,32 @@ export class StripeBillingService {
       credits: input.pack.credits,
       packId: input.pack.packId
     };
+  }
+
+  private async resolveReusablePaymentMethodId(stripeCustomerId: string): Promise<string | null> {
+    if (!this.stripe) {
+      throw new Error("Stripe billing is not configured.");
+    }
+
+    const customer = await this.stripe.customers.retrieve(stripeCustomerId, {
+      expand: ["invoice_settings.default_payment_method"]
+    });
+    if (!("deleted" in customer && customer.deleted)) {
+      const defaultPaymentMethod = customer.invoice_settings?.default_payment_method;
+      if (typeof defaultPaymentMethod === "string" && defaultPaymentMethod) {
+        return defaultPaymentMethod;
+      }
+      if (defaultPaymentMethod && typeof defaultPaymentMethod !== "string") {
+        return defaultPaymentMethod.id;
+      }
+    }
+
+    const cardPaymentMethods = await this.stripe.paymentMethods.list({
+      customer: stripeCustomerId,
+      type: "card",
+      limit: 1
+    });
+    return cardPaymentMethods.data[0]?.id ?? null;
   }
 
   async getCheckoutSession(sessionId: string): Promise<{
