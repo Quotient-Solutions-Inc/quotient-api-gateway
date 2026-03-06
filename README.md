@@ -16,7 +16,6 @@ x402-style monetization and policy gateway in front of `quotient-api`.
   - `POST /api/internal/billing/checkout-session`
   - `GET /api/internal/billing/checkout-session/status?sessionId=...`
   - `GET/POST /api/internal/billing/auto-recharge`
-- Serves a public gateway skill artifact at `/public/skills/quotient-api-gateway/SKILL.md`.
 
 ## Route Pricing Policy
 

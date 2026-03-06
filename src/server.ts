@@ -2,9 +2,6 @@ import "dotenv/config";
 import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import crypto from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
 import { URL } from "node:url";
 import { Neo4jBillingStore } from "./billing/store.js";
 import { StripeBillingService } from "./billing/stripe.js";
@@ -31,8 +28,6 @@ const billingConfig = loadBillingConfig();
 const billingStore: BillingStoreLike = new Neo4jBillingStore(billingConfig);
 const stripeBilling = new StripeBillingService(billingConfig);
 const x402Gateway = new X402PaymentGateway(billingConfig);
-const thisDir = path.dirname(fileURLToPath(import.meta.url));
-const publicSkillPath = path.resolve(thisDir, "../public/skills/quotient-api-gateway/SKILL.md");
 const MIN_PURCHASE_UNITS = 5;
 const CORS_ALLOW_HEADERS = [
   "Content-Type",
@@ -495,15 +490,6 @@ function respondWithX402Instructions(
   );
 }
 
-async function servePublicSkill(res: ServerResponse): Promise<void> {
-  const markdown = await readFile(publicSkillPath, "utf8");
-  res.writeHead(200, {
-    "content-type": "text/markdown; charset=utf-8",
-    "cache-control": "public, max-age=300"
-  });
-  res.end(markdown);
-}
-
 async function handleStripeWebhook(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (req.method !== "POST") {
     json(res, 405, { error: "method_not_allowed", message: "Use POST." });
@@ -672,15 +658,6 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/health") {
       json(res, 200, { ok: true, service: "quotient-api-gateway" });
-      return;
-    }
-
-    if (
-      (pathname === "/public/skills/quotient-api-gateway/SKILL.md" ||
-        pathname === "/public/skills/quotient-gateway/SKILL.md") &&
-      req.method === "GET"
-    ) {
-      await servePublicSkill(res);
       return;
     }
 
