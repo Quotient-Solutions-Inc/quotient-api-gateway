@@ -82,8 +82,8 @@ X402_ENABLED_NETWORKS=eip155:84532
 X402_PAY_TO_EIP155_84532=0xYourSepoliaReceiveWallet
 STRIPE_SECRET_KEY=sk_live_or_test_xxx
 STRIPE_WEBHOOK_SECRET=whsec_xxx
-STRIPE_CHECKOUT_SUCCESS_URL=https://quotient-api.vercel.app/api-portal/dashboard
-STRIPE_CHECKOUT_CANCEL_URL=https://quotient-api.vercel.app/api-portal/dashboard
+STRIPE_CHECKOUT_SUCCESS_URL=http://localhost:3000/api-portal/dashboard
+STRIPE_CHECKOUT_CANCEL_URL=http://localhost:3000/api-portal/dashboard
 QUOTIENT_INTERNAL_SERVICE_TOKEN=replace_me
 ```
 

@@ -100,7 +100,7 @@ sequenceDiagram
 
 ## Required environment variables
 
-- `QUOTIENT_API_BASE_URL` (example: `https://quotient-api.vercel.app`)
+- `QUOTIENT_API_BASE_URL` (example: `http://localhost:3000`)
 - `QUOTIENT_GATEWAY_SHARED_SECRET` (must match `quotient-api`)
 - `QUOTIENT_INTERNAL_SERVICE_TOKEN` (must match `quotient-api`; used for internal checkout/provision calls)
 - `X402_FACILITATOR_URL`
@@ -158,10 +158,9 @@ To configure the Stripe unit item:
 2. On the product metadata, set:
    - `catalog=quotient_api_credits` (hardcoded gateway catalog filter)
    - required: `pack_id=<stable_pack_id>` (mandatory for reloads)
-3. On the product metadata, also set:
    - `credits=<positive integer>` (credits granted per $1 unit)
-4. Ensure the price is active + one-time and in `usd`.
-5. Restart gateway (or wait for the 300-second plan cache TTL), then verify:
+3. Ensure the price is active + one-time and in `usd`.
+4. Restart gateway (or wait for the 300-second plan cache TTL), then verify:
    - call `GET /api/internal/billing/plans` with internal bearer token
    - confirm the discovered unit item has `amountUsd=1` and expected `credits`
 

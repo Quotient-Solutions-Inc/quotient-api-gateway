@@ -27,7 +27,7 @@ cp .env.example .env
 Required values:
 
 - `PORT` (default `3001`)
-- `QUOTIENT_API_BASE_URL` (default `https://quotient-api.vercel.app`)
+- `QUOTIENT_API_BASE_URL` (default `http://localhost:3000`)
 - `QUOTIENT_GATEWAY_SHARED_SECRET` (required; must match quotient-api)
 - `X402_FACILITATOR_URL` (default `https://x402.org/facilitator`)
 - `X402_ENABLED_NETWORKS` (comma-separated CAIP-2 values)

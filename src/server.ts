@@ -24,7 +24,7 @@ interface ApiError {
 }
 const config: Config = {
   port: Number(process.env.PORT || 3001),
-  quotientApiBaseUrl: process.env.QUOTIENT_API_BASE_URL || "https://quotient-api.vercel.app",
+  quotientApiBaseUrl: process.env.QUOTIENT_API_BASE_URL || "http://localhost:3000",
   gatewaySharedSecret: process.env.QUOTIENT_GATEWAY_SHARED_SECRET || ""
 };
 const billingConfig = loadBillingConfig();
@@ -34,6 +34,14 @@ const x402Gateway = new X402PaymentGateway(billingConfig);
 const thisDir = path.dirname(fileURLToPath(import.meta.url));
 const publicSkillPath = path.resolve(thisDir, "../public/skills/quotient-api-gateway/SKILL.md");
 const MIN_PURCHASE_UNITS = 5;
+const CORS_ALLOW_HEADERS = [
+  "Content-Type",
+  "Authorization",
+  "X-Request-Id",
+  "X-Quotient-Api-Key",
+  "Payment-Signature",
+  "Payment-Identifier"
+].join(", ");
 
 if (!config.gatewaySharedSecret) {
   console.error("Missing QUOTIENT_GATEWAY_SHARED_SECRET");
@@ -642,10 +650,20 @@ const server = http.createServer(async (req, res) => {
   if (!res.hasHeader("x-request-id")) {
     res.setHeader("x-request-id", requestId);
   }
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", CORS_ALLOW_HEADERS);
+  res.setHeader("Access-Control-Max-Age", "86400");
 
   try {
     if (!req.url) {
       json(res, 400, { error: "invalid_request", message: "Missing URL." });
+      return;
+    }
+
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
       return;
     }
 
