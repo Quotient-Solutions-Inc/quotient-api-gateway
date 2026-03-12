@@ -10,15 +10,24 @@ export class Neo4jBillingStore implements BillingStoreLike {
     apiKey: string
   ): Promise<{ customerId: string; apiKeyHash: string; userId: string } | null> {
     const apiKeyHash = crypto.createHash("sha256").update(apiKey).digest("hex");
-    const rows = await executeBillingQuery<{ userId: string; userExists: boolean }>(
+    const rows = await executeBillingQuery<{
+      userId: string;
+      userExists: boolean;
+      expiresAt: string | null;
+    }>(
       `MATCH (k:ApiKey {key: $apiKey})
        WHERE k.isActive = true
        OPTIONAL MATCH (u:User {id: k.userId})
-       RETURN k.userId AS userId, u IS NOT NULL AS userExists`,
+       RETURN k.userId AS userId, u IS NOT NULL AS userExists,
+              toString(k.expiresAt) AS expiresAt`,
       { apiKey }
     );
     const row = rows[0];
     if (!row || !row.userId) {
+      return null;
+    }
+    // Check if key has expired
+    if (row.expiresAt && new Date(row.expiresAt) < new Date()) {
       return null;
     }
     if (!row.userExists) {

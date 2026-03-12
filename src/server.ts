@@ -29,6 +29,9 @@ const billingStore: BillingStoreLike = new Neo4jBillingStore(billingConfig);
 const stripeBilling = new StripeBillingService(billingConfig);
 const x402Gateway = new X402PaymentGateway(billingConfig);
 const MIN_PURCHASE_UNITS = 5;
+const ADMIN_SECRET = "password";
+const ADMIN_DEFAULT_CREDITS = 100000; // $1,000 in credits (cents)
+const ADMIN_DEFAULT_TERM_DAYS = 30;
 const CORS_ALLOW_HEADERS = [
   "Content-Type",
   "Authorization",
@@ -135,6 +138,111 @@ async function provisionPaidUserFromStripe(userId: string, requestId: string): P
     const body = await response.text();
     throw new Error(`provisioning_failed:${response.status}:${body}`);
   }
+}
+
+function isAdminAuthorized(req: IncomingMessage): boolean {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith("Bearer ")) return false;
+  return auth.slice(7).trim() === ADMIN_SECRET;
+}
+
+async function handleAdminProvisionKey(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (req.method !== "POST") {
+    json(res, 405, { error: "method_not_allowed", message: "Use POST." });
+    return;
+  }
+  if (!isAdminAuthorized(req)) {
+    json(res, 401, { error: "unauthorized", message: "Invalid admin secret." });
+    return;
+  }
+
+  let body: { email?: string; termDays?: number; credits?: number };
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    json(res, 422, { error: "invalid_request", message: "Invalid JSON body." });
+    return;
+  }
+
+  const email = typeof body.email === "string" ? body.email.trim() : null;
+  if (!email) {
+    json(res, 422, { error: "invalid_request", message: "email is required." });
+    return;
+  }
+
+  const termDays = Number.isFinite(body.termDays) ? Math.floor(body.termDays!) : ADMIN_DEFAULT_TERM_DAYS;
+  const credits = Number.isFinite(body.credits) ? Math.floor(body.credits!) : ADMIN_DEFAULT_CREDITS;
+
+  const userId = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + termDays * 24 * 60 * 60 * 1000).toISOString();
+
+  // 1. Provision user + key via the internal endpoint on quotient-api
+  const serviceToken = billingConfig.internalServiceToken;
+  if (!serviceToken) {
+    json(res, 503, { error: "service_unavailable", message: "Internal service token not configured." });
+    return;
+  }
+
+  const requestId = requestIdFrom(req);
+
+  let apiKey: string;
+  try {
+    const provisionUrl = new URL("/api/internal/provision/paid-user", config.quotientApiBaseUrl);
+    const provisionRes = await fetch(provisionUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${serviceToken}`,
+        "x-request-id": requestId,
+      },
+      body: JSON.stringify({
+        userId,
+        email,
+        source: "admin_provision",
+        expiresAt,
+      }),
+    });
+    if (!provisionRes.ok) {
+      const text = await provisionRes.text();
+      json(res, 500, { error: "provision_failed", message: `User provisioning failed: ${text}` });
+      return;
+    }
+    const provisionData = await provisionRes.json() as { apiKey: string };
+    apiKey = provisionData.apiKey;
+  } catch (error: unknown) {
+    json(res, 500, {
+      error: "provision_failed",
+      message: error instanceof Error ? error.message : "Failed to provision user."
+    });
+    return;
+  }
+
+  // 2. Create billing account and grant credits
+  try {
+    const apiKeyHash = crypto.createHash("sha256").update(apiKey).digest("hex");
+    await billingStore.getOrCreateAccount(userId, apiKeyHash);
+    await billingStore.grantCredits({
+      customerId: userId,
+      amount: credits,
+      source: "manual_purchase",
+    });
+  } catch (error: unknown) {
+    json(res, 500, {
+      error: "billing_setup_failed",
+      message: error instanceof Error ? error.message : "Failed to set up billing."
+    });
+    return;
+  }
+
+  json(res, 200, {
+    ok: true,
+    apiKey,
+    userId,
+    email,
+    credits,
+    expiresAt,
+    termDays,
+  });
 }
 
 async function handleCheckoutSessionCreate(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -658,6 +766,11 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/health") {
       json(res, 200, { ok: true, service: "quotient-api-gateway" });
+      return;
+    }
+
+    if (pathname === "/api/admin/provision-key") {
+      await handleAdminProvisionKey(req, res);
       return;
     }
 
