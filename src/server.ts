@@ -101,7 +101,7 @@ async function proxyToQuotient(req: IncomingMessage, body?: Buffer): Promise<Res
 
   // Forward body for POST/PUT/PATCH
   if (body && (method === "POST" || method === "PUT" || method === "PATCH")) {
-    fetchOptions.body = body;
+    fetchOptions.body = body.toString("utf-8");
   }
 
   return fetch(upstreamUrl, fetchOptions);
