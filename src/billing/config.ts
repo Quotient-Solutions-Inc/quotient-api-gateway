@@ -1,3 +1,4 @@
+// src/billing/config.ts
 export interface X402Config {
   facilitatorUrl: string;
   enabledNetworks: readonly string[];
@@ -24,27 +25,43 @@ const STRIPE_PACK_PRODUCT_METADATA_VALUE = "quotient_api_credits";
 const STRIPE_PACK_CREDITS_METADATA_KEY = "credits";
 
 export interface MonetizedRoutePolicy {
-  id: "markets" | "intelligence" | "signals";
-  match: (pathname: string) => boolean;
+  id: "markets" | "mispriced" | "intelligence" | "signals" | "forecast";
+  match: (pathname: string, method?: string) => boolean;
   x402RoutePatterns: readonly string[];
   creditCost: number;
   x402Amount: number;
 }
 
 export const MONETIZED_ROUTE_POLICIES: readonly MonetizedRoutePolicy[] = [
+  // Order matters: more specific patterns first
+  {
+    id: "forecast",
+    match: (pathname, method) =>
+      pathname === "/api/v1/forecast" && (method === "POST" || method === undefined),
+    x402RoutePatterns: ["POST /api/v1/forecast"],
+    creditCost: 100,
+    x402Amount: 1.00,
+  },
   {
     id: "intelligence",
     match: (pathname) => /^\/api\/v1\/markets\/[^/]+\/intelligence$/.test(pathname),
     x402RoutePatterns: ["GET /api/v1/markets/*/intelligence"],
     creditCost: 2,
-    x402Amount: 0.02
+    x402Amount: 0.1,
   },
   {
     id: "signals",
     match: (pathname) => /^\/api\/v1\/markets\/[^/]+\/signals$/.test(pathname),
     x402RoutePatterns: ["GET /api/v1/markets/*/signals"],
     creditCost: 2,
-    x402Amount: 0.015
+    x402Amount: 0.1,
+  },
+  {
+    id: "mispriced",
+    match: (pathname) => pathname === "/api/v1/markets/mispriced",
+    x402RoutePatterns: ["GET /api/v1/markets/mispriced"],
+    creditCost: 5,
+    x402Amount: 0.25,
   },
   {
     id: "markets",
@@ -52,13 +69,16 @@ export const MONETIZED_ROUTE_POLICIES: readonly MonetizedRoutePolicy[] = [
       pathname === "/api/v1/markets" || pathname === "/api/v1/markets/lookup",
     x402RoutePatterns: ["GET /api/v1/markets", "GET /api/v1/markets/lookup"],
     creditCost: 1,
-    x402Amount: 0.01
-  }
+    x402Amount: 0.01,
+  },
 ] as const;
 
-export function resolveMonetizedRoutePolicy(pathname: string): MonetizedRoutePolicy | null {
+export function resolveMonetizedRoutePolicy(
+  pathname: string,
+  method?: string
+): MonetizedRoutePolicy | null {
   for (const policy of MONETIZED_ROUTE_POLICIES) {
-    if (policy.match(pathname)) return policy;
+    if (policy.match(pathname, method)) return policy;
   }
   return null;
 }
@@ -78,7 +98,7 @@ function parseEnabledNetworks(input: string | undefined): string[] {
 function resolvePayToByNetwork(enabledNetworks: readonly string[]): Record<string, string> {
   const configured: Record<string, string | undefined> = {
     "eip155:8453": process.env.X402_PAY_TO_EIP155_8453,
-    "eip155:84532": process.env.X402_PAY_TO_EIP155_84532
+    "eip155:84532": process.env.X402_PAY_TO_EIP155_84532,
   };
   const result: Record<string, string> = {};
   for (const network of enabledNetworks) {
@@ -110,7 +130,7 @@ export function loadBillingConfig(): BillingConfig {
       enabledNetworks,
       payToByNetwork,
       paymentIdRequired: false,
-      idempotencyTtlSeconds: 3600
-    }
+      idempotencyTtlSeconds: 3600,
+    },
   };
 }

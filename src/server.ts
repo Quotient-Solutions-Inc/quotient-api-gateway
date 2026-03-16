@@ -1,3 +1,4 @@
+// src/server.ts
 import "dotenv/config";
 import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -80,9 +81,10 @@ async function readJsonBody<T>(req: IncomingMessage): Promise<T> {
   }
 }
 
-async function proxyToQuotient(req: IncomingMessage): Promise<Response> {
+async function proxyToQuotient(req: IncomingMessage, body?: Buffer): Promise<Response> {
   const reqUrl = new URL(req.url || "/", "http://localhost");
   const upstreamUrl = new URL(reqUrl.pathname + reqUrl.search, config.quotientApiBaseUrl);
+  const method = req.method || "GET";
   const upstreamHeaders: Record<string, string> = {
     "content-type": "application/json",
     "x-quotient-gateway-secret": config.gatewaySharedSecret
@@ -92,10 +94,17 @@ async function proxyToQuotient(req: IncomingMessage): Promise<Response> {
     upstreamHeaders["x-request-id"] = incomingRequestId.trim();
   }
 
-  return fetch(upstreamUrl, {
-    method: "GET",
-    headers: upstreamHeaders
-  });
+  const fetchOptions: RequestInit = {
+    method,
+    headers: upstreamHeaders,
+  };
+
+  // Forward body for POST/PUT/PATCH
+  if (body && (method === "POST" || method === "PUT" || method === "PATCH")) {
+    fetchOptions.body = body;
+  }
+
+  return fetch(upstreamUrl, fetchOptions);
 }
 
 function emitUsageLog(event: CreditUsageEvent): void {
@@ -176,7 +185,6 @@ async function handleAdminProvisionKey(req: IncomingMessage, res: ServerResponse
   const userId = crypto.randomUUID();
   const expiresAt = new Date(Date.now() + termDays * 24 * 60 * 60 * 1000).toISOString();
 
-  // 1. Provision user + key via the internal endpoint on quotient-api
   const serviceToken = billingConfig.internalServiceToken;
   if (!serviceToken) {
     json(res, 503, { error: "service_unavailable", message: "Internal service token not configured." });
@@ -217,7 +225,6 @@ async function handleAdminProvisionKey(req: IncomingMessage, res: ServerResponse
     return;
   }
 
-  // 2. Create billing account and grant credits
   try {
     const apiKeyHash = crypto.createHash("sha256").update(apiKey).digest("hex");
     await billingStore.getOrCreateAccount(userId, apiKeyHash);
@@ -517,7 +524,6 @@ async function canUseCredits(
       previousRemaining >= threshold &&
       consumed.remaining < threshold;
 
-
     if (crossedBelowThreshold) {
       attemptedRecharge = true;
       try {
@@ -538,7 +544,6 @@ async function canUseCredits(
             error: message
           })
         );
-        // Auto-recharge failure should not break request handling.
       }
     }
   } else {
@@ -560,7 +565,6 @@ async function canUseCredits(
           error: message
         })
       );
-      // Auto-recharge failure should not break request handling.
     }
   }
 
@@ -706,6 +710,9 @@ async function handleBillingSummary(req: IncomingMessage, res: ServerResponse): 
   }
 }
 
+// Allowed HTTP methods for monetized /api/v1/* routes
+const MONETIZED_METHODS = new Set(["GET", "POST"]);
+
 const server = http.createServer(async (req, res) => {
   const startedAtMs = Date.now();
   const requestId = requestIdFrom(req);
@@ -817,8 +824,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (pathname.startsWith("/api/v1/") && req.method === "GET") {
-      const policy = resolveMonetizedRoutePolicy(pathname);
+    if (pathname.startsWith("/api/v1/") && MONETIZED_METHODS.has(method)) {
+      const policy = resolveMonetizedRoutePolicy(pathname, method);
       if (!policy) {
         json(res, 422, {
           error: "unpriced_route",
@@ -827,6 +834,13 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const requestId = requestIdFrom(req);
+
+      // Read body upfront for POST requests so we can forward it
+      let reqBody: Buffer | undefined;
+      if (method === "POST" || method === "PUT" || method === "PATCH") {
+        reqBody = await readRawBody(req);
+      }
+
       const clientKey = req.headers["x-quotient-api-key"];
       const hasClientKey = typeof clientKey === "string" && clientKey.trim() !== "";
 
@@ -866,7 +880,7 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
-        const upstreamRes = await proxyToQuotient(req);
+        const upstreamRes = await proxyToQuotient(req, reqBody);
         const text = await upstreamRes.text();
         res.writeHead(upstreamRes.status, {
           "content-type": upstreamRes.headers.get("content-type") || "application/json; charset=utf-8",
@@ -883,7 +897,7 @@ const server = http.createServer(async (req, res) => {
         respondWithX402Instructions(res, paymentAuth.response.status, paymentAuth.response, requestId);
         return;
       }
-      const upstreamRes = await proxyToQuotient(req);
+      const upstreamRes = await proxyToQuotient(req, reqBody);
       const text = await upstreamRes.text();
       const settlementHeaders = await x402Gateway.finalizeSettlement(paymentAuth, text, upstreamRes.status);
       emitUsageLog({
