@@ -49,7 +49,7 @@ export const MONETIZED_ROUTE_POLICIES: readonly MonetizedRoutePolicy[] = [
     match: (pathname) => /^\/api\/v1\/markets\/[^/]+\/intelligence$/.test(pathname),
     x402RoutePatterns: ["GET /api/v1/markets/*/intelligence"],
     creditCost: 5,
-    x402Amount: 0.05,
+    x402Amount: 0.25,
   },
   {
     id: "signals",
