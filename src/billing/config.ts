@@ -34,34 +34,36 @@ export interface MonetizedRoutePolicy {
 
 export const MONETIZED_ROUTE_POLICIES: readonly MonetizedRoutePolicy[] = [
   // Order matters: more specific patterns first
-  {
-    id: "forecast",
-    match: (pathname, method) =>
-      pathname === "/api/v1/forecast" && (method === "POST" || method === undefined),
-    x402RoutePatterns: ["POST /api/v1/forecast"],
-    creditCost: 100,
-    x402Amount: 1.00,
-  },
+
+  // ── forecast: disabled until Anthropic credit budget is secured ──
+  // {
+  //   id: "forecast",
+  //   match: (pathname, method) =>
+  //     pathname === "/api/v1/forecast" && (method === "POST" || method === undefined),
+  //   x402RoutePatterns: ["POST /api/v1/forecast"],
+  //   creditCost: 100,
+  //   x402Amount: 1.00,
+  // },
   {
     id: "intelligence",
     match: (pathname) => /^\/api\/v1\/markets\/[^/]+\/intelligence$/.test(pathname),
     x402RoutePatterns: ["GET /api/v1/markets/*/intelligence"],
-    creditCost: 2,
-    x402Amount: 0.1,
+    creditCost: 3,
+    x402Amount: 0.03,
   },
   {
     id: "signals",
     match: (pathname) => /^\/api\/v1\/markets\/[^/]+\/signals$/.test(pathname),
     x402RoutePatterns: ["GET /api/v1/markets/*/signals"],
     creditCost: 2,
-    x402Amount: 0.1,
+    x402Amount: 0.02,
   },
   {
     id: "mispriced",
     match: (pathname) => pathname === "/api/v1/markets/mispriced",
     x402RoutePatterns: ["GET /api/v1/markets/mispriced"],
-    creditCost: 5,
-    x402Amount: 0.25,
+    creditCost: 1,
+    x402Amount: 0.01,
   },
   {
     id: "markets",
@@ -69,7 +71,7 @@ export const MONETIZED_ROUTE_POLICIES: readonly MonetizedRoutePolicy[] = [
       pathname === "/api/v1/markets" || pathname === "/api/v1/markets/lookup",
     x402RoutePatterns: ["GET /api/v1/markets", "GET /api/v1/markets/lookup"],
     creditCost: 1,
-    x402Amount: 0.01,
+    x402Amount: 0.005,
   },
 ] as const;
 

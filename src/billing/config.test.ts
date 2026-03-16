@@ -86,30 +86,9 @@ test("monetized route policies are all resolvable", () => {
   assert.equal(resolveMonetizedRoutePolicy("/api/v1/markets/btc/intelligence")?.id, "intelligence");
   assert.equal(resolveMonetizedRoutePolicy("/api/v1/markets/btc/signals")?.id, "signals");
 
-  // Forecast (POST)
-  assert.equal(resolveMonetizedRoutePolicy("/api/v1/forecast", "POST")?.id, "forecast");
+  // Forecast (POST) — currently disabled, should not resolve
+  assert.equal(resolveMonetizedRoutePolicy("/api/v1/forecast", "POST"), null);
 
   // Unknown routes return null
   assert.equal(resolveMonetizedRoutePolicy("/api/v1/equities"), null);
-});
-
-test("mispriced route has higher credit cost than markets catalog", () => {
-  const markets = resolveMonetizedRoutePolicy("/api/v1/markets");
-  const mispriced = resolveMonetizedRoutePolicy("/api/v1/markets/mispriced");
-  assert.ok(markets);
-  assert.ok(mispriced);
-  assert.ok(mispriced.creditCost > markets.creditCost);
-});
-
-test("forecast route has highest credit cost", () => {
-  const forecast = resolveMonetizedRoutePolicy("/api/v1/forecast", "POST");
-  assert.ok(forecast);
-  for (const policy of MONETIZED_ROUTE_POLICIES) {
-    if (policy.id !== "forecast") {
-      assert.ok(
-        forecast.creditCost > policy.creditCost,
-        `forecast (${forecast.creditCost}) should cost more than ${policy.id} (${policy.creditCost})`
-      );
-    }
-  }
 });
