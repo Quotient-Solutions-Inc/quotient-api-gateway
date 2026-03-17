@@ -331,6 +331,11 @@ function handlePublicPricing(req: IncomingMessage, res: ServerResponse): void {
     return;
   }
 
+  const x402PaymentAssets = billingConfig.x402.enabledNetworks.map((network) => ({
+    network,
+    token: "USDC"
+  }));
+
   const pricing = MONETIZED_ROUTE_POLICIES.flatMap((policy) =>
     policy.x402RoutePatterns.map((routePattern) => ({
       policyId: policy.id,
@@ -342,6 +347,7 @@ function handlePublicPricing(req: IncomingMessage, res: ServerResponse): void {
 
   json(res, 200, {
     source: "gateway_monetized_route_policies",
+    x402PaymentAssets,
     pricing
   });
 }
