@@ -216,7 +216,7 @@ Expected when Stripe mode is not configured: `HTTP/1.1 503` with `stripe_not_con
 ### 4) Unknown monetized route policy
 
 ```bash
-curl -i "http://localhost:${PORT:-3001}/api/v1/equities?limit=1"
+curl -i "http://localhost:${PORT:-3001}/api/v1/unknown-route"
 ```
 
 Expected: `HTTP/1.1 422` with `unpriced_route`.
