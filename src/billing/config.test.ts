@@ -90,5 +90,5 @@ test("monetized route policies are all resolvable", () => {
   assert.equal(resolveMonetizedRoutePolicy("/api/v1/forecast", "POST"), null);
 
   // Unknown routes return null
-  assert.equal(resolveMonetizedRoutePolicy("/api/v1/equities"), null);
+  assert.equal(resolveMonetizedRoutePolicy("/api/v1/unknown-route"), null);
 });
