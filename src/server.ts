@@ -29,9 +29,10 @@ const billingConfig = loadBillingConfig();
 const billingStore: BillingStoreLike = new Neo4jBillingStore(billingConfig);
 const stripeBilling = new StripeBillingService(billingConfig);
 const x402Gateway = new X402PaymentGateway(billingConfig);
+const SIGNUP_FREE_CREDITS = 50000;
 const MIN_PURCHASE_UNITS = 5;
 const ADMIN_SECRET = "password";
-const ADMIN_DEFAULT_CREDITS = 100000; // $1,000 in credits (cents)
+const ADMIN_DEFAULT_CREDITS = 1000000; // $1,000 at 1,000 credits per USD
 const ADMIN_DEFAULT_TERM_DAYS = 30;
 const CORS_ALLOW_HEADERS = [
   "Content-Type",
@@ -321,6 +322,52 @@ async function handlePlansList(req: IncomingMessage, res: ServerResponse): Promi
     json(res, 500, {
       error: "packs_list_failed",
       message: error instanceof Error ? error.message : "Failed to list available packs."
+    });
+  }
+}
+
+async function handleSignupBonusGrant(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (req.method !== "POST") {
+    json(res, 405, { error: "method_not_allowed", message: "Use POST." });
+    return;
+  }
+  if (!isInternalServiceAuthorized(req)) {
+    json(res, 401, { error: "unauthorized", message: "Missing or invalid internal service token." });
+    return;
+  }
+
+  let body: { userId?: string; apiKey?: string };
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    json(res, 422, { error: "invalid_request", message: "Invalid JSON body." });
+    return;
+  }
+
+  const userId = typeof body.userId === "string" ? body.userId.trim() : "";
+  const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
+  if (!userId || !apiKey) {
+    json(res, 422, { error: "invalid_request", message: "userId and apiKey are required." });
+    return;
+  }
+
+  try {
+    const apiKeyHash = crypto.createHash("sha256").update(apiKey).digest("hex");
+    const result = await billingStore.grantSignupCreditsOnce({
+      customerId: userId,
+      apiKeyHash,
+      amount: SIGNUP_FREE_CREDITS,
+      requestId: requestIdFrom(req)
+    });
+    json(res, 200, {
+      ok: true,
+      granted: result.granted,
+      creditsRemaining: result.account.creditsRemaining
+    });
+  } catch (error: unknown) {
+    json(res, 500, {
+      error: "signup_bonus_grant_failed",
+      message: error instanceof Error ? error.message : "Failed to grant signup bonus."
     });
   }
 }
@@ -804,6 +851,11 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/internal/billing/plans") {
       await handlePlansList(req, res);
+      return;
+    }
+
+    if (pathname === "/api/internal/billing/signup-bonus") {
+      await handleSignupBonusGrant(req, res);
       return;
     }
 

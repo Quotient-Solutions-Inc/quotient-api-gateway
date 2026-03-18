@@ -92,3 +92,14 @@ test("monetized route policies are all resolvable", () => {
   // Unknown routes return null
   assert.equal(resolveMonetizedRoutePolicy("/api/v1/equities"), null);
 });
+
+test("credit costs map to x402 pricing at 1 credit = $0.001", () => {
+  for (const policy of MONETIZED_ROUTE_POLICIES) {
+    const expectedCredits = Math.round(policy.x402Amount * 1000);
+    assert.equal(
+      policy.creditCost,
+      expectedCredits,
+      `${policy.id} creditCost (${policy.creditCost}) must equal x402Amount (${policy.x402Amount}) * 1000`
+    );
+  }
+});

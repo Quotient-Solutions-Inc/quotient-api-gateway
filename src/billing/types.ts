@@ -97,6 +97,12 @@ export interface BillingStoreLike {
     stripePaymentIntentId?: string;
     stripeCheckoutSessionId?: string;
   }): Promise<BillingAccount>;
+  grantSignupCreditsOnce(input: {
+    customerId: string;
+    apiKeyHash: string;
+    amount: number;
+    requestId: string;
+  }): Promise<{ account: BillingAccount; granted: boolean }>;
   hasProcessedStripeEvent(eventId: string): Promise<boolean>;
   markStripeEventProcessed(eventId: string, customerId: string): Promise<void>;
   setStripeCustomerId(customerId: string, stripeCustomerId: string): Promise<BillingAccount>;

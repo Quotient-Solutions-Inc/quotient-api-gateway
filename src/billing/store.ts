@@ -3,8 +3,16 @@ import type { AutoRechargeSettings, BillingAccount, BillingStoreLike } from "./t
 import type { BillingConfig } from "./config.js";
 import { executeBillingQuery } from "./neo4j.js";
 
+type BillingQueryExecutor = <T = Record<string, unknown>>(
+  query: string,
+  params?: Record<string, unknown>
+) => Promise<T[]>;
+
 export class Neo4jBillingStore implements BillingStoreLike {
-  constructor(private readonly config: BillingConfig) {}
+  constructor(
+    private readonly config: BillingConfig,
+    private readonly queryExecutor: BillingQueryExecutor = executeBillingQuery
+  ) {}
 
   async resolveCustomerFromApiKey(
     apiKey: string
@@ -42,7 +50,7 @@ export class Neo4jBillingStore implements BillingStoreLike {
 
   async getOrCreateAccount(customerId: string, apiKeyHash: string): Promise<BillingAccount> {
     const credits = 0;
-    const rows = await executeBillingQuery<{
+    const rows = await this.queryExecutor<{
       customerId: string;
       apiKeyHash: string;
       stripeCustomerId: string | null;
@@ -190,6 +198,86 @@ export class Neo4jBillingStore implements BillingStoreLike {
     const account = await this.getAccount(input.customerId);
     if (!account) throw new Error("Billing account not found.");
     return account;
+  }
+
+  async grantSignupCreditsOnce(input: {
+    customerId: string;
+    apiKeyHash: string;
+    amount: number;
+    requestId: string;
+  }): Promise<{ account: BillingAccount; granted: boolean }> {
+    const rows = await this.queryExecutor<{
+      customerId: string;
+      apiKeyHash: string;
+      stripeCustomerId: string | null;
+      stripeDefaultPaymentMethodId: string | null;
+      autoRechargeEnabled: boolean | null;
+      autoRechargeThreshold: number | null;
+      autoRechargeUnits: number | null;
+      creditsRemaining: number;
+      updatedAt: string;
+      granted: boolean;
+    }>(
+      `MATCH (u:User {id: $customerId})
+       MERGE (b:BillingAccount {customerId: $customerId})
+       ON CREATE SET
+         b.apiKeyHash = $apiKeyHash,
+         b.creditsRemaining = 0,
+         b.autoRechargeEnabled = false,
+         b.autoRechargeThreshold = 0,
+         b.signupBonusGranted = false,
+         b.updatedAt = datetime()
+       MERGE (u)-[:HAS_BILLING_ACCOUNT]->(b)
+       WITH b, COALESCE(b.signupBonusGranted, false) AS alreadyGranted
+       FOREACH (_ IN CASE WHEN alreadyGranted THEN [] ELSE [1] END |
+         SET b.creditsRemaining = COALESCE(b.creditsRemaining, 0) + $amount,
+             b.signupBonusGranted = true,
+             b.signupBonusGrantedAt = datetime(),
+             b.updatedAt = datetime()
+         CREATE (e:BillingLedgerEvent {
+           id: randomUUID(),
+           customerId: $customerId,
+           source: 'signup_bonus',
+           amount: $amount,
+           requestId: $requestId,
+           balanceAfter: b.creditsRemaining,
+           createdAt: datetime()
+         })
+       )
+       RETURN b.customerId AS customerId,
+              b.apiKeyHash AS apiKeyHash,
+              b.stripeCustomerId AS stripeCustomerId,
+              b.stripeDefaultPaymentMethodId AS stripeDefaultPaymentMethodId,
+              b.autoRechargeEnabled AS autoRechargeEnabled,
+              b.autoRechargeThreshold AS autoRechargeThreshold,
+              b.autoRechargeUnits AS autoRechargeUnits,
+              COALESCE(b.creditsRemaining, 0) AS creditsRemaining,
+              toString(b.updatedAt) AS updatedAt,
+              CASE WHEN alreadyGranted THEN false ELSE true END AS granted`,
+      {
+        customerId: input.customerId,
+        apiKeyHash: input.apiKeyHash,
+        amount: input.amount,
+        requestId: input.requestId
+      }
+    );
+
+    const row = rows[0];
+    if (!row) throw new Error("Failed to grant signup credits.");
+    return {
+      granted: row.granted,
+      account: {
+        customerId: row.customerId,
+        apiKeyHash: row.apiKeyHash,
+        stripeCustomerId: row.stripeCustomerId ?? undefined,
+        stripeDefaultPaymentMethodId: row.stripeDefaultPaymentMethodId ?? undefined,
+        autoRechargeEnabled: row.autoRechargeEnabled === true,
+        autoRechargeThreshold: row.autoRechargeThreshold ?? 0,
+        autoRechargeUnits: row.autoRechargeUnits ?? undefined,
+        creditsRemaining: row.creditsRemaining,
+        updatedAt: row.updatedAt
+      }
+    };
   }
 
   async hasProcessedStripeEvent(eventId: string): Promise<boolean> {
