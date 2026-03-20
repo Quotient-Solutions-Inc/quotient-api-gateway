@@ -21,7 +21,14 @@ function moneyString(amountUsd: number): string {
 }
 
 function toRouteDescription(policy: MonetizedRoutePolicy): string {
-  return `Quotient API access for ${policy.id}`;
+  const descriptions: Record<MonetizedRoutePolicy["id"], string> = {
+    markets: "List tracked prediction markets with coverage metadata.",
+    mispriced: "Find markets where Quotient probability diverges from market odds.",
+    intelligence: "Get full Quotient intelligence and drivers for a market slug.",
+    signals: "Get paginated analyst signals for a market slug.",
+    forecast: "Generate a Quotient forecast (disabled unless policy is enabled)."
+  };
+  return descriptions[policy.id] ?? `Quotient API access for ${policy.id}`;
 }
 
 function toFallbackChallenge(policy: MonetizedRoutePolicy): Record<string, unknown> {
@@ -122,7 +129,145 @@ type RequirePaymentResult =
       cachedHeaders: Record<string, string> | null;
     };
 
+function toBazaarInputSchema(routePattern: string, policy: MonetizedRoutePolicy): Record<string, unknown> {
+  if (routePattern === "GET /api/v1/markets/lookup") {
+    return {
+      queryParams: {
+        slugs: {
+          type: "string",
+          description: "Comma-separated market slugs (1-10). Mutually exclusive with condition_ids."
+        },
+        condition_ids: {
+          type: "string",
+          description: "Comma-separated market condition IDs (1-10). Mutually exclusive with slugs."
+        }
+      }
+    };
+  }
+
+  switch (policy.id) {
+    case "markets":
+      return {
+        queryParams: {
+          topic: {
+            type: "string",
+            description: "Optional topic/category filter."
+          },
+          max_forecast_age: {
+            type: "integer",
+            description: "Max forecast age in hours.",
+            minimum: 1
+          },
+          sort: {
+            type: "string",
+            enum: ["updated_desc", "volume_desc", "signal_count_desc"],
+            description: "Sort order for market list."
+          },
+          cursor: {
+            type: "string",
+            description: "Opaque pagination cursor."
+          },
+          limit: {
+            type: "integer",
+            description: "Page size (1-50).",
+            minimum: 1,
+            maximum: 50
+          }
+        }
+      };
+    case "mispriced":
+      return {
+        queryParams: {
+          min_spread: {
+            type: "number",
+            description: "Minimum absolute spread between Quotient and market odds (0-1).",
+            minimum: 0,
+            maximum: 1
+          },
+          max_forecast_age: {
+            type: "integer",
+            description: "Max forecast age in hours.",
+            minimum: 1
+          },
+          sort: {
+            type: "string",
+            enum: ["spread_desc", "spread_asc", "updated_desc", "volume_desc"],
+            description: "Sort order for mispriced list."
+          },
+          cursor: {
+            type: "string",
+            description: "Opaque pagination cursor."
+          },
+          limit: {
+            type: "integer",
+            description: "Page size (1-50).",
+            minimum: 1,
+            maximum: 50
+          }
+        }
+      };
+    case "intelligence":
+      return {
+        pathParams: {
+          slug: {
+            type: "string",
+            description: "Market slug identifier."
+          }
+        }
+      };
+    case "signals":
+      return {
+        pathParams: {
+          slug: {
+            type: "string",
+            description: "Market slug identifier."
+          }
+        },
+        queryParams: {
+          cursor: {
+            type: "string",
+            description: "Opaque pagination cursor."
+          },
+          limit: {
+            type: "integer",
+            description: "Page size (1-50).",
+            minimum: 1,
+            maximum: 50
+          }
+        }
+      };
+    case "forecast":
+      return {
+        body: {
+          type: "object",
+          description: "Forecast request payload."
+        }
+      };
+  }
+}
+
+function toBazaarOutputSchema(policy: MonetizedRoutePolicy): Record<string, unknown> {
+  const descriptionByPolicy: Record<MonetizedRoutePolicy["id"], string> = {
+    markets: "Paginated market list with coverage metadata.",
+    mispriced: "Paginated list of markets with forecast vs odds spread.",
+    intelligence: "Single market intelligence object with forecast and drivers.",
+    signals: "Paginated market signal list with sentiment summary.",
+    forecast: "Forecast generation result."
+  };
+  return {
+    type: "object",
+    description: descriptionByPolicy[policy.id],
+    additionalProperties: true
+  };
+}
+
 function buildRoutes(config: BillingConfig): RoutesConfig {
+  // Sync contract: this route declaration is what facilitators discover.
+  // Keep it aligned with:
+  // - src/billing/config.ts MONETIZED_ROUTE_POLICIES (route set + pricing),
+  // - src/server.ts handlePublicPricing (public pricing payload),
+  // - quotient-api/src/app/api/v1/openapi.json/route.ts (public contract),
+  // - quotient-api/src/app/llms.txt/route.ts and quotient-api/public/skill/skill.md (agent docs).
   const routes: Record<string, RouteConfig> = {};
   const acceptsForPolicy = (policy: MonetizedRoutePolicy) =>
     config.x402.enabledNetworks.map((network) => {
@@ -145,6 +290,11 @@ function buildRoutes(config: BillingConfig): RoutesConfig {
         description: toRouteDescription(policy),
         mimeType: "application/json",
         extensions: {
+          bazaar: {
+            discoverable: true,
+            inputSchema: toBazaarInputSchema(routePattern, policy),
+            outputSchema: toBazaarOutputSchema(policy)
+          },
           "payment-identifier": declarePaymentIdentifierExtension(config.x402.paymentIdRequired)
         },
         unpaidResponseBody: () => ({

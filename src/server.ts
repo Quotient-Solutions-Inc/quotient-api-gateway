@@ -373,6 +373,11 @@ async function handleSignupBonusGrant(req: IncomingMessage, res: ServerResponse)
 }
 
 function handlePublicPricing(req: IncomingMessage, res: ServerResponse): void {
+  // Sync contract: pricing is derived from MONETIZED_ROUTE_POLICIES and must stay
+  // consistent with Bazaar route declarations and API discovery docs:
+  // - src/billing/x402.ts (extensions.bazaar + accepts/price),
+  // - quotient-api/src/app/api/public/pricing/route.ts (mirror endpoint),
+  // - quotient-api/src/app/api/v1/openapi.json/route.ts and src/app/llms.txt/route.ts.
   if (req.method !== "GET") {
     json(res, 405, { error: "method_not_allowed", message: "Use GET." });
     return;

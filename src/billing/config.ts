@@ -39,6 +39,14 @@ function creditsFromX402Amount(x402AmountUsd: number): number {
 }
 
 export const MONETIZED_ROUTE_POLICIES: readonly MonetizedRoutePolicy[] = [
+  // Sync contract: when adding/changing/removing a monetized route here, update all of:
+  // 1) gateway Bazaar metadata in src/billing/x402.ts (buildRoutes/toBazaar* helpers),
+  // 2) gateway pricing output in src/server.ts (handlePublicPricing),
+  // 3) API discovery/docs in quotient-api:
+  //    - src/app/api/v1/openapi.json/route.ts
+  //    - src/app/llms.txt/route.ts
+  //    - public/skill/skill.md
+  //    - src/app/api/public/pricing/route.ts (gateway mirror behavior/copy)
   // Order matters: more specific patterns first
 
   // ── forecast: disabled until Anthropic credit budget is secured ──
