@@ -12,8 +12,8 @@ import {
 import { HTTPFacilitatorClient, x402ResourceServer } from "@x402/core/server";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
 import { declarePaymentIdentifierExtension, extractPaymentIdentifier } from "@x402/extensions/payment-identifier";
-import type { BillingConfig, MonetizedRoutePolicy } from "./config.js";
-import { MONETIZED_ROUTE_POLICIES } from "./config.js";
+import type { BillingConfig } from "./config.js";
+import type { BazaarInputSpec, MonetizedRoutePolicy } from "./contract.js";
 
 function moneyString(amountUsd: number): string {
   const value = amountUsd.toFixed(6).replace(/\.?0+$/, "");
@@ -21,14 +21,7 @@ function moneyString(amountUsd: number): string {
 }
 
 function toRouteDescription(policy: MonetizedRoutePolicy): string {
-  const descriptions: Record<MonetizedRoutePolicy["id"], string> = {
-    markets: "List tracked prediction markets with coverage metadata.",
-    mispriced: "Find markets where Quotient probability diverges from market odds.",
-    intelligence: "Get full Quotient intelligence and drivers for a market slug.",
-    signals: "Get paginated analyst signals for a market slug.",
-    forecast: "Generate a Quotient forecast (disabled unless policy is enabled)."
-  };
-  return descriptions[policy.id] ?? `Quotient API access for ${policy.id}`;
+  return policy.description || policy.summary || `Quotient API access for ${policy.id}`;
 }
 
 function toFallbackChallenge(policy: MonetizedRoutePolicy): Record<string, unknown> {
@@ -129,144 +122,25 @@ type RequirePaymentResult =
       cachedHeaders: Record<string, string> | null;
     };
 
-function toBazaarInputSchema(routePattern: string, policy: MonetizedRoutePolicy): Record<string, unknown> {
-  if (routePattern === "GET /api/v1/markets/lookup") {
-    return {
-      queryParams: {
-        slugs: {
-          type: "string",
-          description: "Comma-separated market slugs (1-10). Mutually exclusive with condition_ids."
-        },
-        condition_ids: {
-          type: "string",
-          description: "Comma-separated market condition IDs (1-10). Mutually exclusive with slugs."
-        }
-      }
-    };
-  }
-
-  switch (policy.id) {
-    case "markets":
-      return {
-        queryParams: {
-          topic: {
-            type: "string",
-            description: "Optional topic/category filter."
-          },
-          max_forecast_age: {
-            type: "integer",
-            description: "Max forecast age in hours.",
-            minimum: 1
-          },
-          sort: {
-            type: "string",
-            enum: ["updated_desc", "volume_desc", "signal_count_desc"],
-            description: "Sort order for market list."
-          },
-          cursor: {
-            type: "string",
-            description: "Opaque pagination cursor."
-          },
-          limit: {
-            type: "integer",
-            description: "Page size (1-50).",
-            minimum: 1,
-            maximum: 50
-          }
-        }
-      };
-    case "mispriced":
-      return {
-        queryParams: {
-          min_spread: {
-            type: "number",
-            description: "Minimum absolute spread between Quotient and market odds (0-1).",
-            minimum: 0,
-            maximum: 1
-          },
-          max_forecast_age: {
-            type: "integer",
-            description: "Max forecast age in hours.",
-            minimum: 1
-          },
-          sort: {
-            type: "string",
-            enum: ["spread_desc", "spread_asc", "updated_desc", "volume_desc"],
-            description: "Sort order for mispriced list."
-          },
-          cursor: {
-            type: "string",
-            description: "Opaque pagination cursor."
-          },
-          limit: {
-            type: "integer",
-            description: "Page size (1-50).",
-            minimum: 1,
-            maximum: 50
-          }
-        }
-      };
-    case "intelligence":
-      return {
-        pathParams: {
-          slug: {
-            type: "string",
-            description: "Market slug identifier."
-          }
-        }
-      };
-    case "signals":
-      return {
-        pathParams: {
-          slug: {
-            type: "string",
-            description: "Market slug identifier."
-          }
-        },
-        queryParams: {
-          cursor: {
-            type: "string",
-            description: "Opaque pagination cursor."
-          },
-          limit: {
-            type: "integer",
-            description: "Page size (1-50).",
-            minimum: 1,
-            maximum: 50
-          }
-        }
-      };
-    case "forecast":
-      return {
-        body: {
-          type: "object",
-          description: "Forecast request payload."
-        }
-      };
-  }
+function toBazaarInputSpec(_routePattern: string, policy: MonetizedRoutePolicy): BazaarInputSpec {
+  return policy.inputSpec;
 }
 
 function toBazaarOutputSchema(policy: MonetizedRoutePolicy): Record<string, unknown> {
-  const descriptionByPolicy: Record<MonetizedRoutePolicy["id"], string> = {
-    markets: "Paginated market list with coverage metadata.",
-    mispriced: "Paginated list of markets with forecast vs odds spread.",
-    intelligence: "Single market intelligence object with forecast and drivers.",
-    signals: "Paginated market signal list with sentiment summary.",
-    forecast: "Forecast generation result."
-  };
   return {
-    type: "object",
-    description: descriptionByPolicy[policy.id],
-    additionalProperties: true
+    type: "json",
+    example: {
+      description: policy.summary
+    }
   };
 }
 
-function buildRoutes(config: BillingConfig): RoutesConfig {
+function buildRoutes(config: BillingConfig, policies: readonly MonetizedRoutePolicy[]): RoutesConfig {
   // Sync contract: this route declaration is what facilitators discover.
   // Keep it aligned with:
-  // - src/billing/config.ts MONETIZED_ROUTE_POLICIES (route set + pricing),
+  // - src/billing/contract.ts (canonical route set + pricing),
   // - src/server.ts handlePublicPricing (public pricing payload),
-  // - quotient-api/src/app/api/v1/openapi.json/route.ts (public contract),
+  // - quotient-api/src/app/api/v1/openapi.json/route.ts + src/app/openapi.json/route.ts,
   // - quotient-api/src/app/llms.txt/route.ts and quotient-api/public/skill/skill.md (agent docs).
   const routes: Record<string, RouteConfig> = {};
   const acceptsForPolicy = (policy: MonetizedRoutePolicy) =>
@@ -283,8 +157,37 @@ function buildRoutes(config: BillingConfig): RoutesConfig {
       };
     });
 
-  for (const policy of MONETIZED_ROUTE_POLICIES) {
+  for (const policy of policies) {
     for (const routePattern of policy.x402RoutePatterns) {
+      const [method] = routePattern.split(" ");
+      const inputSpec = toBazaarInputSpec(routePattern, policy);
+      const inputSchemaProperties: Record<string, unknown> = {
+        type: {
+          type: "string",
+          const: "http"
+        },
+        method: {
+          type: "string",
+          enum: [method]
+        }
+      };
+      if (inputSpec.queryParams) {
+        inputSchemaProperties.queryParams = {
+          type: "object",
+          properties: inputSpec.queryParams,
+          additionalProperties: false
+        };
+      }
+      if (inputSpec.pathParams) {
+        inputSchemaProperties.pathParams = {
+          type: "object",
+          properties: inputSpec.pathParams,
+          additionalProperties: false
+        };
+      }
+      if (inputSpec.body) {
+        inputSchemaProperties.body = inputSpec.body;
+      }
       routes[routePattern] = {
         accepts: acceptsForPolicy(policy),
         description: toRouteDescription(policy),
@@ -292,8 +195,37 @@ function buildRoutes(config: BillingConfig): RoutesConfig {
         extensions: {
           bazaar: {
             discoverable: true,
-            inputSchema: toBazaarInputSchema(routePattern, policy),
-            outputSchema: toBazaarOutputSchema(policy)
+            info: {
+              input: {
+                type: "http",
+                method,
+                ...(inputSpec.queryParams ? { queryParams: inputSpec.queryParams } : {}),
+                ...(inputSpec.pathParams ? { pathParams: inputSpec.pathParams } : {}),
+                ...(inputSpec.body ? { body: inputSpec.body } : {})
+              },
+              output: toBazaarOutputSchema(policy)
+            },
+            schema: {
+              $schema: "https://json-schema.org/draft/2020-12/schema",
+              type: "object",
+              properties: {
+                input: {
+                  type: "object",
+                  properties: inputSchemaProperties,
+                  required: ["type", "method"],
+                  additionalProperties: false
+                },
+                output: {
+                  type: "object",
+                  properties: {
+                    type: { type: "string" },
+                    example: { type: "object" }
+                  },
+                  required: ["type"]
+                }
+              },
+              required: ["input", "output"]
+            }
           },
           "payment-identifier": declarePaymentIdentifierExtension(config.x402.paymentIdRequired)
         },
@@ -312,12 +244,15 @@ export class X402PaymentGateway {
   private readonly cache: PaymentIdCache;
   private readonly httpResourceServer: x402HTTPResourceServer;
 
-  constructor(private readonly billingConfig: BillingConfig) {
+  constructor(
+    private readonly billingConfig: BillingConfig,
+    private readonly policies: readonly MonetizedRoutePolicy[]
+  ) {
     const facilitatorClient = new HTTPFacilitatorClient({
       url: billingConfig.x402.facilitatorUrl
     });
     const resourceServer = new x402ResourceServer(facilitatorClient).register("eip155:*", new ExactEvmScheme());
-    this.httpResourceServer = new x402HTTPResourceServer(resourceServer, buildRoutes(billingConfig));
+    this.httpResourceServer = new x402HTTPResourceServer(resourceServer, buildRoutes(billingConfig, this.policies));
     this.cache = new PaymentIdCache(billingConfig.x402.idempotencyTtlSeconds);
     this.httpResourceServer.onProtectedRequest(async (context) => {
       if (!context.paymentHeader) return;

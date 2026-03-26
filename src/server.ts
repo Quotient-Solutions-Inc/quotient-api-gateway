@@ -6,7 +6,14 @@ import crypto from "node:crypto";
 import { URL } from "node:url";
 import { Neo4jBillingStore } from "./billing/store.js";
 import { StripeBillingService } from "./billing/stripe.js";
-import { MONETIZED_ROUTE_POLICIES, loadBillingConfig, resolveMonetizedRoutePolicy } from "./billing/config.js";
+import { loadBillingConfig } from "./billing/config.js";
+import {
+  buildCanonicalContractFromOpenApi,
+  hashCanonicalOpenApi,
+  loadCanonicalContract,
+  resolveMonetizedRoutePolicy,
+  type CanonicalContract
+} from "./billing/contract.js";
 import type { BillingStoreLike, CreditUsageEvent } from "./billing/types.js";
 import { X402PaymentGateway } from "./billing/x402.js";
 
@@ -26,9 +33,20 @@ const config: Config = {
   gatewaySharedSecret: process.env.QUOTIENT_GATEWAY_SHARED_SECRET || ""
 };
 const billingConfig = loadBillingConfig();
+const canonicalOpenApiUrl =
+  process.env.QUOTIENT_CANONICAL_OPENAPI_URL ||
+  new URL("/api/v1/openapi.json", config.quotientApiBaseUrl).toString();
+const contractRefreshIntervalMs = Number(process.env.QUOTIENT_CONTRACT_REFRESH_INTERVAL_MS || 60000);
+let activeCanonicalContract: CanonicalContract = await loadCanonicalContract({
+  sourceUrl: canonicalOpenApiUrl
+});
+let activeMonetizedRoutePolicies = activeCanonicalContract.policies;
+let activeCanonicalHash = hashCanonicalOpenApi(activeCanonicalContract.openApi);
 const billingStore: BillingStoreLike = new Neo4jBillingStore(billingConfig);
 const stripeBilling = new StripeBillingService(billingConfig);
-const x402Gateway = new X402PaymentGateway(billingConfig);
+let x402Gateway = new X402PaymentGateway(billingConfig, activeMonetizedRoutePolicies);
+await x402Gateway.initialize();
+let contractRefreshInFlight: Promise<void> | null = null;
 const SIGNUP_FREE_CREDITS = 50000;
 const MIN_PURCHASE_UNITS = 5;
 const ADMIN_SECRET = "password";
@@ -82,6 +100,30 @@ async function readJsonBody<T>(req: IncomingMessage): Promise<T> {
   }
 }
 
+async function proxyPublicDocument(
+  req: IncomingMessage,
+  res: ServerResponse,
+  targetPath: string
+): Promise<void> {
+  if (req.method !== "GET") {
+    json(res, 405, { error: "method_not_allowed", message: "Use GET." });
+    return;
+  }
+  const upstreamUrl = new URL(targetPath, config.quotientApiBaseUrl);
+  const upstreamRes = await fetch(upstreamUrl, {
+    method: "GET",
+    headers: {
+      "x-request-id": requestIdFrom(req)
+    }
+  });
+  const body = await upstreamRes.text();
+  res.writeHead(upstreamRes.status, {
+    "content-type": upstreamRes.headers.get("content-type") || "text/plain; charset=utf-8",
+    "cache-control": upstreamRes.headers.get("cache-control") || "public, max-age=300"
+  });
+  res.end(body);
+}
+
 async function proxyToQuotient(req: IncomingMessage, body?: Buffer): Promise<Response> {
   const reqUrl = new URL(req.url || "/", "http://localhost");
   const upstreamUrl = new URL(reqUrl.pathname + reqUrl.search, config.quotientApiBaseUrl);
@@ -106,6 +148,110 @@ async function proxyToQuotient(req: IncomingMessage, body?: Buffer): Promise<Res
   }
 
   return fetch(upstreamUrl, fetchOptions);
+}
+
+async function applyCanonicalOpenApi(
+  openApi: Record<string, unknown>,
+  source: "network",
+  sourceLabel: string
+): Promise<{ updated: boolean; hash: string; policyCount: number }> {
+  const nextContract = buildCanonicalContractFromOpenApi(openApi, sourceLabel, source);
+  const nextHash = hashCanonicalOpenApi(nextContract.openApi);
+  if (nextHash === activeCanonicalHash) {
+    return { updated: false, hash: nextHash, policyCount: nextContract.policies.length };
+  }
+
+  const nextGateway = new X402PaymentGateway(billingConfig, nextContract.policies);
+  await nextGateway.initialize();
+
+  activeCanonicalContract = nextContract;
+  activeMonetizedRoutePolicies = nextContract.policies;
+  activeCanonicalHash = nextHash;
+  x402Gateway = nextGateway;
+
+  console.log(
+    JSON.stringify({
+      type: "canonical_contract_applied",
+      timestamp: new Date().toISOString(),
+      source,
+      sourceLabel,
+      policyCount: nextContract.policies.length,
+      hash: nextHash
+    })
+  );
+
+  return { updated: true, hash: nextHash, policyCount: nextContract.policies.length };
+}
+
+async function refreshCanonicalContractFromSource(trigger: string): Promise<void> {
+  if (contractRefreshInFlight) {
+    await contractRefreshInFlight;
+    return;
+  }
+  contractRefreshInFlight = (async () => {
+    try {
+      const loaded = await loadCanonicalContract({
+        sourceUrl: canonicalOpenApiUrl
+      });
+      await applyCanonicalOpenApi(loaded.openApi, loaded.loadedFrom, canonicalOpenApiUrl);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(
+        JSON.stringify({
+          type: "canonical_contract_refresh_failed",
+          timestamp: new Date().toISOString(),
+          trigger,
+          sourceUrl: canonicalOpenApiUrl,
+          error: message
+        })
+      );
+    }
+  })();
+  try {
+    await contractRefreshInFlight;
+  } finally {
+    contractRefreshInFlight = null;
+  }
+}
+
+async function handleCanonicalContractSync(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  if (req.method !== "POST") {
+    json(res, 405, { error: "method_not_allowed", message: "Use POST." });
+    return;
+  }
+  if (!isInternalServiceAuthorized(req)) {
+    json(res, 401, { error: "unauthorized", message: "Missing or invalid internal service token." });
+    return;
+  }
+  let body: { openApi?: unknown; sourceUrl?: string };
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    json(res, 422, { error: "invalid_request", message: "Invalid JSON body." });
+    return;
+  }
+  if (!body || typeof body !== "object" || !body.openApi || typeof body.openApi !== "object") {
+    json(res, 422, { error: "invalid_request", message: "openApi object is required." });
+    return;
+  }
+
+  try {
+    const sourceLabel = typeof body.sourceUrl === "string" && body.sourceUrl.trim() !== ""
+      ? body.sourceUrl.trim()
+      : "internal_contract_sync";
+    const result = await applyCanonicalOpenApi(body.openApi as Record<string, unknown>, "network", sourceLabel);
+    json(res, 200, {
+      ok: true,
+      updated: result.updated,
+      hash: result.hash,
+      policyCount: result.policyCount
+    });
+  } catch (error: unknown) {
+    json(res, 422, {
+      error: "invalid_contract",
+      message: error instanceof Error ? error.message : "Failed to apply canonical contract."
+    });
+  }
 }
 
 function emitUsageLog(event: CreditUsageEvent): void {
@@ -373,11 +519,9 @@ async function handleSignupBonusGrant(req: IncomingMessage, res: ServerResponse)
 }
 
 function handlePublicPricing(req: IncomingMessage, res: ServerResponse): void {
-  // Sync contract: pricing is derived from MONETIZED_ROUTE_POLICIES and must stay
-  // consistent with Bazaar route declarations and API discovery docs:
-  // - src/billing/x402.ts (extensions.bazaar + accepts/price),
-  // - quotient-api/src/app/api/public/pricing/route.ts (mirror endpoint),
-  // - quotient-api/src/app/api/v1/openapi.json/route.ts and src/app/llms.txt/route.ts.
+  // Sync contract: pricing is derived from the canonical OpenAPI contract loaded
+  // from quotient-api and refreshed in-memory at runtime (pull + internal sync).
+  // This powers gateway enforcement and x402 discovery metadata together.
   if (req.method !== "GET") {
     json(res, 405, { error: "method_not_allowed", message: "Use GET." });
     return;
@@ -388,7 +532,7 @@ function handlePublicPricing(req: IncomingMessage, res: ServerResponse): void {
     token: "USDC"
   }));
 
-  const pricing = MONETIZED_ROUTE_POLICIES.flatMap((policy) =>
+  const pricing = activeMonetizedRoutePolicies.flatMap((policy) =>
     policy.x402RoutePatterns.map((routePattern) => ({
       policyId: policy.id,
       routePattern,
@@ -401,6 +545,39 @@ function handlePublicPricing(req: IncomingMessage, res: ServerResponse): void {
     source: "gateway_monetized_route_policies",
     x402PaymentAssets,
     pricing
+  });
+}
+
+function handleWellKnownX402(req: IncomingMessage, res: ServerResponse): void {
+  if (req.method !== "GET") {
+    json(res, 405, { error: "method_not_allowed", message: "Use GET." });
+    return;
+  }
+  const resources = Array.from(
+    new Set(
+      activeMonetizedRoutePolicies.flatMap((policy) => policy.x402RoutePatterns)
+    )
+  );
+  json(
+    res,
+    200,
+    {
+      version: 1,
+      resources,
+    },
+    {
+      "cache-control": "public, max-age=300",
+    }
+  );
+}
+
+function handleOpenApiDiscovery(req: IncomingMessage, res: ServerResponse): void {
+  if (req.method !== "GET") {
+    json(res, 405, { error: "method_not_allowed", message: "Use GET." });
+    return;
+  }
+  json(res, 200, activeCanonicalContract.openApi, {
+    "cache-control": "public, max-age=300",
   });
 }
 
@@ -834,6 +1011,21 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (pathname === "/openapi.json" || pathname === "/api/v1/openapi.json") {
+      handleOpenApiDiscovery(req, res);
+      return;
+    }
+
+    if (pathname === "/llms.txt" || pathname === "/skill/skill.md" || pathname.startsWith("/skill/references/")) {
+      await proxyPublicDocument(req, res, pathname);
+      return;
+    }
+
+    if (pathname === "/.well-known/x402") {
+      handleWellKnownX402(req, res);
+      return;
+    }
+
     if (pathname === "/api/admin/provision-key") {
       await handleAdminProvisionKey(req, res);
       return;
@@ -856,6 +1048,11 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/internal/billing/plans") {
       await handlePlansList(req, res);
+      return;
+    }
+
+    if (pathname === "/api/internal/discovery/contract-sync") {
+      await handleCanonicalContractSync(req, res);
       return;
     }
 
@@ -888,8 +1085,20 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname.startsWith("/api/v1/") && MONETIZED_METHODS.has(method)) {
-      const policy = resolveMonetizedRoutePolicy(pathname, method);
+      const policy = resolveMonetizedRoutePolicy(pathname, method, activeMonetizedRoutePolicies);
       if (!policy) {
+        const matchingPolicies = activeMonetizedRoutePolicies.filter((candidate) =>
+          candidate.matcher.test(pathname)
+        );
+        if (matchingPolicies.length > 0) {
+          const allowedMethods = Array.from(new Set(matchingPolicies.map((candidate) => candidate.method)));
+          json(res, 405, {
+            error: "method_not_allowed",
+            message: `Route '${pathname}' does not support method '${method}'.`,
+            allowed_methods: allowedMethods
+          });
+          return;
+        }
         json(res, 422, {
           error: "unpriced_route",
           message: `No monetization policy defined for route '${pathname}'.`
@@ -989,7 +1198,12 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-await x402Gateway.initialize();
+if (Number.isFinite(contractRefreshIntervalMs) && contractRefreshIntervalMs > 0) {
+  const timer = setInterval(() => {
+    void refreshCanonicalContractFromSource("interval");
+  }, contractRefreshIntervalMs);
+  timer.unref?.();
+}
 
 server.listen(config.port, () => {
   console.log(`quotient-api-gateway listening on http://localhost:${config.port}`);

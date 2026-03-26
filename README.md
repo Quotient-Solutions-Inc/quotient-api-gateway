@@ -1,38 +1,68 @@
 # Quotient API Gateway
 
-x402-style monetization and policy gateway in front of `quotient-api`.
+x402 monetization and policy gateway in front of `quotient-api`.
 
-## What it does
+## Repo Relationship
+
+`quotient-api-gateway` is the public payable edge. `quotient-api` is the canonical contract authoring repo.
+
+- Canonical payable contract source: API OpenAPI (`/openapi.json`).
+- Gateway loads that contract and enforces it at runtime.
+- Gateway refreshes contract by:
+  - pulling canonical OpenAPI at startup + interval,
+  - accepting push sync from API startup via internal endpoint.
+
+## What the Gateway Does
 
 - Returns `402 Payment Required` for protected routes when payment proof is missing.
-- Proxies read endpoints (`/api/v1/markets*`) to Quotient API.
-- Supports dual-path access:
-  - user key via `x-quotient-api-key` for credit-balance metering in the gateway
-  - x402 paid fallback via `PAYMENT-SIGNATURE` when key is missing
-- Authenticates upstream to `quotient-api` using gateway service auth (`x-quotient-gateway-secret`).
-- Handles Stripe credit purchase webhook events at `/api/billing/stripe/webhook`.
-- Exposes internal checkout/session endpoints for portal orchestration:
-  - `GET /api/internal/billing/plans`
-  - `POST /api/internal/billing/checkout-session`
-  - `GET /api/internal/billing/checkout-session/status?sessionId=...`
-  - `GET/POST /api/internal/billing/auto-recharge`
+- Proxies public intelligence endpoints to upstream API.
+- Supports dual access:
+  - `x-quotient-api-key` credits path
+  - x402 paid fallback (`PAYMENT-SIGNATURE`)
+- Authenticates upstream calls with `x-quotient-gateway-secret`.
+- Exposes billing and checkout orchestration endpoints.
+- Serves discovery endpoints on the gateway origin:
+  - `/openapi.json` (canonical machine contract surface)
+  - `/.well-known/x402`
+  - `/llms.txt`, `/skill/skill.md`, `/skill/references/*` (proxied)
 
-## Route Pricing Policy
+## Canonical Pricing and Policy Source
 
-Monetized public route policy is centralized in `src/billing/config.ts` via a single registry resolver.
+- Gateway pricing and route policy are **not hardcoded**.
+- They are derived from canonical API OpenAPI `x-payment-info` metadata.
+- Public pricing endpoint:
+  - `GET /api/public/pricing`
+  - derived from in-memory canonical policy snapshot.
+- If a `/api/v1/*` request is not represented in loaded payable policy, gateway returns `422 unpriced_route`.
 
-- Each monetized route entry defines both:
-  - credit cost
-  - x402 amount
-- Gateway billing and x402 challenge logic both resolve from this same policy.
-- Strict mode is enforced: if a `/api/v1/*` route has no policy entry, gateway returns `422 unpriced_route`.
-- Public pricing view is exposed at `GET /api/public/pricing` for docs/portal consumers.
+## Key Files
+
+- Canonical contract parsing + validation + resolver:
+  - `src/billing/contract.ts`
+- Runtime x402 challenge/settlement route declarations:
+  - `src/billing/x402.ts`
+- Gateway routing, discovery surfaces, sync endpoints, refresh loop:
+  - `src/server.ts`
+- Billing storage and Stripe integration:
+  - `src/billing/store.ts`
+  - `src/billing/stripe.ts`
+
+## Contract Sync Model
+
+- Pull:
+  - Gateway loads from `QUOTIENT_CANONICAL_OPENAPI_URL` (or `${QUOTIENT_API_BASE_URL}/api/v1/openapi.json`) on startup.
+  - Gateway periodically refreshes (`QUOTIENT_CONTRACT_REFRESH_INTERVAL_MS`, default 60s).
+- Push:
+  - API startup posts canonical OpenAPI to:
+    - `POST /api/internal/discovery/contract-sync`
+  - Auth required:
+    - `Authorization: Bearer ${QUOTIENT_INTERNAL_SERVICE_TOKEN}`
 
 ## x402 Headers
 
-- Client sends payment proof in `PAYMENT-SIGNATURE`.
-- Gateway returns challenge metadata in `PAYMENT-REQUIRED` for `402` responses.
-- Gateway returns settlement metadata in `PAYMENT-RESPONSE` after successful paid requests.
+- Client payment proof: `PAYMENT-SIGNATURE`
+- Gateway challenge metadata (on `402`): `PAYMENT-REQUIRED`
+- Settlement metadata (on success): `PAYMENT-RESPONSE`
 
 ## Quickstart
 
@@ -97,11 +127,13 @@ sequenceDiagram
     Gateway-->>Stripe: 200 OK
 ```
 
-## Required environment variables
+## Required Environment Variables
 
 - `QUOTIENT_API_BASE_URL` (example: `http://localhost:3000`)
 - `QUOTIENT_GATEWAY_SHARED_SECRET` (must match `quotient-api`)
 - `QUOTIENT_INTERNAL_SERVICE_TOKEN` (must match `quotient-api`; used for internal checkout/provision calls)
+- `QUOTIENT_CANONICAL_OPENAPI_URL` (optional override; default derives from `QUOTIENT_API_BASE_URL`)
+- `QUOTIENT_CONTRACT_REFRESH_INTERVAL_MS` (optional; default `60000`)
 - `X402_FACILITATOR_URL`
 - `X402_ENABLED_NETWORKS` (CAIP-2 list, e.g. `eip155:84532,eip155:8453`)
 - `X402_PAY_TO_EIP155_84532`, `X402_PAY_TO_EIP155_8453`
@@ -110,6 +142,43 @@ sequenceDiagram
 - `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASS` (required)
 
 See `.env.example` for full list.
+
+## Adding or Updating a Payable Endpoint
+
+Canonical definition lives in API repo. Process:
+
+1. In `quotient-api`, add/update endpoint implementation and canonical OpenAPI operation.
+2. In API OpenAPI operation, ensure:
+   - `x-payment-info` is present and valid,
+   - `responses["402"]` is `Payment Required`,
+   - request input schema is present.
+3. Deploy/update API.
+4. Gateway picks up update via startup sync push and periodic pull.
+5. Validate on gateway origin:
+   - `/openapi.json`
+   - `/.well-known/x402`
+   - `/api/public/pricing`
+   - runtime `402` flow.
+
+## Testing and Deployment Workflow
+
+Gateway local checks:
+
+```bash
+npm install
+npm run typecheck
+npm test
+```
+
+Cross-repo integration checks:
+
+1. Start API and gateway with shared secrets/tokens.
+2. Confirm contract sync succeeds (push and/or pull).
+3. Verify discovery:
+   - `npx -y @agentcash/discovery@latest discover "$GATEWAY_ORIGIN"`
+4. Verify runtime:
+   - API key path (`e2e:test-api-key`)
+   - x402 path (`e2e:test-x402-payment`)
 
 ## Local E2E
 
@@ -169,3 +238,14 @@ To configure the Stripe unit item:
 2. Validate idempotent retries using `payment-identifier` (same id returns cached settlement headers).
 3. Enable limited production traffic on Base Sepolia or shadow traffic.
 4. Add `eip155:8453` and `X402_PAY_TO_EIP155_8453` for full Base mainnet rollout.
+
+## Change Matrix
+
+| If you change... | Update these files | Validate |
+|---|---|---|
+| Canonical contract parsing/rules | `src/billing/contract.ts`, `src/billing/contract.test.ts`, `src/server.ts` sync handlers | `npm run typecheck`, `npm test`, discovery audit |
+| x402 challenge/settlement metadata | `src/billing/x402.ts`, `src/server.ts` | x402 e2e flow + `PAYMENT-REQUIRED`/`PAYMENT-RESPONSE` headers |
+| Gateway discovery routing/proxy behavior | `src/server.ts` (`/openapi.json`, `/.well-known/x402`, `/llms.txt`, `/skill/*`) | hit all discovery endpoints on gateway origin |
+| Contract refresh/push sync lifecycle | `src/server.ts` refresh loop + `/api/internal/discovery/contract-sync` | API restart (push) and gateway interval pull observe updates |
+| Public pricing response shape | `src/server.ts` `handlePublicPricing`, `src/billing/contract.ts` policy fields | compare `/api/public/pricing` output and paid route runtime behavior |
+| Env/config around contract loading | `src/server.ts`, `.env.example`, README env section | cold start with expected env; verify fail-fast and successful load |
