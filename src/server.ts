@@ -1099,10 +1099,19 @@ const server = http.createServer(async (req, res) => {
           });
           return;
         }
-        json(res, 422, {
-          error: "unpriced_route",
-          message: `No monetization policy defined for route '${pathname}'.`
+        // Route is outside monetized policy scope: proxy upstream without gateway billing/x402 enforcement.
+        const requestId = requestIdFrom(req);
+        const reqBody =
+          method === "POST" || method === "PUT" || method === "PATCH"
+            ? await readRawBody(req)
+            : undefined;
+        const upstreamRes = await proxyToQuotient(req, reqBody);
+        const text = await upstreamRes.text();
+        res.writeHead(upstreamRes.status, {
+          "content-type": upstreamRes.headers.get("content-type") || "application/json; charset=utf-8",
+          "x-request-id": requestId
         });
+        res.end(text);
         return;
       }
       const requestId = requestIdFrom(req);
