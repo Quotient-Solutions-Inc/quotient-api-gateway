@@ -179,9 +179,11 @@ function buildRoutes(config: BillingConfig, policies: readonly MonetizedRoutePol
         };
       }
       if (inputSpec.pathParams) {
+        const requiredPathParams = Object.keys(inputSpec.pathParams);
         inputSchemaProperties.pathParams = {
           type: "object",
           properties: inputSpec.pathParams,
+          ...(requiredPathParams.length > 0 ? { required: requiredPathParams } : {}),
           additionalProperties: false
         };
       }
