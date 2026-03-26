@@ -161,6 +161,10 @@ function buildRoutes(config: BillingConfig, policies: readonly MonetizedRoutePol
     for (const routePattern of policy.x402RoutePatterns) {
       const [method] = routePattern.split(" ");
       const inputSpec = toBazaarInputSpec(routePattern, policy);
+      const requiredInputFields = ["type", "method"];
+      if (inputSpec.queryParams) requiredInputFields.push("queryParams");
+      if (inputSpec.pathParams) requiredInputFields.push("pathParams");
+      if (inputSpec.body) requiredInputFields.push("body");
       const inputSchemaProperties: Record<string, unknown> = {
         type: {
           type: "string",
@@ -214,7 +218,7 @@ function buildRoutes(config: BillingConfig, policies: readonly MonetizedRoutePol
                 input: {
                   type: "object",
                   properties: inputSchemaProperties,
-                  required: ["type", "method"],
+                  required: requiredInputFields,
                   additionalProperties: false
                 },
                 output: {
