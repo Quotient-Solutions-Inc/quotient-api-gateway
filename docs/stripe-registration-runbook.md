@@ -14,7 +14,7 @@ When API credits are unavailable, gateway falls back to x402 v2 payment verifica
 ## 1) Create Stripe Credit Unit Item
 
 The gateway pulls Stripe prices/products directly and expects one active `$1 USD` one-time item.
-Users can purchase/recharge with integer dollar units (minimum 5 units / $5).
+Users can purchase/recharge with integer dollar units (minimum 100 units / $100).
 Credits are granted as:
 
 - `creditsGranted = units * credits`

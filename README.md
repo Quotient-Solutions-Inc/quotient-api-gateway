@@ -215,7 +215,7 @@ These are the events used for credit grants (manual purchase and auto-recharge).
 ## Stripe Credit Unit Onboarding Checklist
 
 The gateway now expects a single Stripe unit price for credit purchases.
-Users choose integer dollar units at checkout/auto-recharge time, with a minimum of 5 units.
+Users choose integer dollar units at checkout/auto-recharge time, with a minimum of 100 units ($100).
 Credits granted are computed as:
 
 - `units * credits_per_dollar`

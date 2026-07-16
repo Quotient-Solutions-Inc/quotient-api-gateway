@@ -48,7 +48,7 @@ let x402Gateway = new X402PaymentGateway(billingConfig, activeMonetizedRoutePoli
 await x402Gateway.initialize();
 let contractRefreshInFlight: Promise<void> | null = null;
 const SIGNUP_FREE_CREDITS = 50000;
-const MIN_PURCHASE_UNITS = 5;
+const MIN_PURCHASE_UNITS = 100;
 const ADMIN_SECRET = "password";
 const ADMIN_DEFAULT_CREDITS = 1000000; // $1,000 at 1,000 credits per USD
 const ADMIN_DEFAULT_TERM_DAYS = 30;

@@ -328,7 +328,7 @@ export class Neo4jBillingStore implements BillingStoreLike {
         ? Math.max(0, Math.floor(rows[0].units))
         : undefined;
     const settings: AutoRechargeSettings = {
-      enabled: rows[0]?.enabled === true && !hasLegacyPack && typeof normalizedUnits === "number" && normalizedUnits >= 5,
+      enabled: rows[0]?.enabled === true && !hasLegacyPack && typeof normalizedUnits === "number" && normalizedUnits >= 100,
       thresholdCredits: rows[0]?.threshold ?? 0
     };
     if (typeof normalizedUnits === "number") settings.units = normalizedUnits;
